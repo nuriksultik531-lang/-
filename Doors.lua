@@ -44,13 +44,24 @@ local function safeLoad(src, chunkName)
     return result
 end
 
-local RAW_URL = "https://raw.githubusercontent.com/Morozhka144/GUI2222/refs/heads/main/Lumina.lua"
+local RAW_URL = "https://raw.githubusercontent.com/nuriksultik531-lang/-/refs/heads/main/Lumina.lua"
+local FALLBACK_URL = "https://raw.githubusercontent.com/Morozhka144/GUI2222/refs/heads/main/Lumina.lua"
 local Lumina
 
 local ok, res = pcall(function()
     local src = game:HttpGet(RAW_URL)
     return safeLoad(src, "MoroLumina")
 end)
+if not (ok and res) then
+    pcall(function()
+        local src = game:HttpGet(FALLBACK_URL)
+        local loaded = safeLoad(src, "MoroLuminaFallback")
+        if loaded then
+            ok = true
+            res = loaded
+        end
+    end)
+end
 if ok and res then
     Lumina = res
 else
