@@ -2437,7 +2437,204 @@ do
     return false
   end
 
-  local function fastLootRoom(room)
+  -- Safe fast walking to avoid Anticheat delta-jump / teleport kicks
+  local function safeWalkTo(targetPos, maxWait, reachDist)
+    maxWait = maxWait or 6
+    reachDist = reachDist or 3.5
+    local char = localPlayer2.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum or hum.Health <= 0 then return false end
+
+    local speed = (options.AutoFarmWalkSpeed and options.AutoFarmWalkSpeed.Value) or 22
+    hum.WalkSpeed = speed
+
+    local startT = tick()
+    local lastPos = root.Position
+    local stuckTicks = 0
+
+    while (tick() - startT < maxWait) do
+      if not (toggles.AutoDoorSkip and toggles.AutoDoorSkip.Value) then break end
+      if hum.Health <= 0 then break end
+
+      -- Threat interrupt: if Rush/Ambush physically spawns, break immediately to hide!
+      if HasRushAmbushBlitz() then
+        return false, "threat"
+      end
+
+      local curPos = root.Position
+      local dist2D = (Vector2.new(curPos.X, curPos.Z) - Vector2.new(targetPos.X, targetPos.Z)).Magnitude
+      if dist2D <= reachDist then
+        return true
+      end
+
+      -- Anti-stuck micro-jump
+      if (curPos - lastPos).Magnitude < 0.2 then
+        stuckTicks = stuckTicks + 1
+        if stuckTicks >= 4 then
+          pcall(function() hum.Jump = true end)
+          stuckTicks = 0
+        end
+      else
+        stuckTicks = 0
+      end
+      lastPos = curPos
+
+      hum:MoveTo(targetPos)
+      task.wait(0.08)
+    end
+    return false, "timeout"
+  end
+
+  -- Auto-Hiding from physical Rush & Ambush (Anti-Hide protection)
+  local function handleThreatHiding()
+    local isThreat, threatObj = HasRushAmbushBlitz()
+    if not isThreat or not threatObj then return end
+
+    local char = localPlayer2.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum or hum.Health <= 0 then return end
+
+    -- Find nearest valid hiding spot (Wardrobe, Locker, Bed)
+    local bestSpot, bestPrompt = nil, nil
+    local minDistance = 9999
+    local curRooms = workspace:FindFirstChild("CurrentRooms")
+
+    if curRooms then
+      for _, desc in ipairs(curRooms:GetDescendants()) do
+        if desc.Name == "Wardrobe" or desc.Name == "Locker" or desc.Name == "Bed" or desc.Name == "Locker_Small" then
+          local pr = desc:FindFirstChildWhichIsA("ProximityPrompt", true)
+          if pr and pr.Enabled and not desc:FindFirstChild("Hide") then
+            local pName = pr.ActionText:lower()
+            local oText = pr.ObjectText:lower()
+            if pName:find("hide") or oText:find("closet") or oText:find("wardrobe") or oText:find("bed") or oText:find("locker") then
+              local pos = (desc:IsA("BasePart") and desc.Position) or (desc:IsA("Model") and desc:GetPivot().Position)
+              if pos then
+                local d = (pos - root.Position).Magnitude
+                if d < minDistance then
+                  minDistance = d
+                  bestSpot = desc
+                  bestPrompt = pr
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+
+    if bestSpot and bestPrompt then
+      local spotPos = (bestSpot:IsA("BasePart") and bestSpot.Position) or bestSpot:GetPivot().Position
+      hum.WalkSpeed = 26
+      safeWalkTo(spotPos, 3.5, 4.0)
+
+      -- Wait until threat is within ~150 studs before entering (protect from Hide!)
+      local threatPart = threatObj:FindFirstChild("HumanoidRootPart") or threatObj.PrimaryPart or (threatObj:IsA("BasePart") and threatObj)
+      local waitStart = tick()
+      while HasRushAmbushBlitz() and (tick() - waitStart < 8) do
+        if threatPart and threatPart.Parent then
+          local dist = (threatPart.Position - root.Position).Magnitude
+          if dist <= 150 then
+            safeFirePrompt(bestPrompt)
+            break
+          end
+        else
+          safeFirePrompt(bestPrompt)
+          break
+        end
+        task.wait(0.04)
+      end
+
+      -- Stay in closet until threat passes by
+      task.wait(0.5)
+      local hideStart = tick()
+      while HasRushAmbushBlitz() and (tick() - hideStart < 5) do
+        if threatPart and threatPart.Parent then
+          local dist = (threatPart.Position - root.Position).Magnitude
+          if dist > 140 and (tick() - hideStart > 1.2) then
+            break -- Already passed by!
+          end
+        end
+        task.wait(0.15)
+      end
+
+      -- Immediately exit closet so Hide never kicks us!
+      task.wait(0.2)
+      pcall(function()
+        local exitPrompt = bestSpot:FindFirstChildWhichIsA("ProximityPrompt", true)
+        if exitPrompt and (exitPrompt.ActionText:lower():find("exit") or exitPrompt.ActionText:lower():find("leave")) then
+          safeFirePrompt(exitPrompt)
+        end
+      end)
+      pcall(function() hum.Jump = true end)
+      task.wait(0.25)
+    end
+  end
+
+  -- Anti-Dupe door checker
+  local function isDupeDoor(doorModel, expectedRoomNum)
+    if not doorModel then return false end
+    if doorModel.Name == "DoorFake" or doorModel.Name == "FakeDoor" then return true end
+    local sign = doorModel:FindFirstChild("Sign", true)
+    if sign then
+      local gui = sign:FindFirstChildWhichIsA("SurfaceGui", true)
+      local label = gui and gui:FindFirstChildWhichIsA("TextLabel", true)
+      if label and label.Text ~= "" then
+        local num = tonumber(label.Text:match("%d+"))
+        if num and expectedRoomNum and num ~= expectedRoomNum then
+          return true -- Wrong room number = fake door!
+        end
+      end
+    end
+    return false
+  end
+
+  -- Finds the true next door in the room, ignoring fake doors
+  local function getRealDoor(room, nextRoomNum)
+    if not room then return nil end
+    local doors = {}
+    for _, child in ipairs(room:GetChildren()) do
+      if child.Name == "Door" and child:IsA("Model") then
+        table.insert(doors, child)
+      end
+    end
+    if #doors == 0 then
+      return room:FindFirstChild("Door")
+    end
+    if #doors == 1 then
+      return doors[1]
+    end
+    -- Multiple doors: find the one that is NOT a dupe
+    for _, d in ipairs(doors) do
+      if not isDupeDoor(d, nextRoomNum) then
+        return d
+      end
+    end
+    return doors[1]
+  end
+
+  -- Screech & Eyes auto-protection
+  local function handleScreechAndEyes()
+    pcall(function()
+      local cam = workspace.CurrentCamera
+      if not cam then return end
+
+      -- Screech: look directly at him so he flees without biting
+      local screech = cam:FindFirstChild("Screech") or workspace:FindFirstChild("Screech")
+      if screech and screech.PrimaryPart then
+        cam.CFrame = CFrame.new(cam.CFrame.Position, screech.PrimaryPart.Position)
+      end
+
+      -- Eyes: look straight down to avoid taking damage
+      local eyes = workspace:FindFirstChild("Eyes") or (workspace.CurrentRooms and workspace.CurrentRooms:FindFirstChild("Eyes", true))
+      if eyes then
+        cam.CFrame = CFrame.new(cam.CFrame.Position) * CFrame.Angles(-math.rad(80), 0, 0)
+      end
+    end)
+  end
+
+  local function fastLootRoom(room, isSeekZone)
     local lootedPrompts = {}
     local char = localPlayer2.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
@@ -2452,19 +2649,30 @@ do
 
     for _, pr in ipairs(prompts) do
       if not (toggles.AutoDoorSkip and toggles.AutoDoorSkip.Value) then break end
+      if HasRushAmbushBlitz() then handleThreatHiding() end
+
       if pr and pr.Parent and pr.Enabled and not lootedPrompts[pr] then
         local pos = getPromptPos(pr)
         if pos then
-          root.CFrame = CFrame.new(pos + Vector3.new(0, 1.2, 0))
-          safeFirePrompt(pr)
-          lootedPrompts[pr] = true
-          task.wait(0.06)
+          if isSeekZone then
+            root.CFrame = CFrame.new(pos + Vector3.new(0, 1.2, 0))
+            safeFirePrompt(pr)
+            lootedPrompts[pr] = true
+            task.wait(0.04)
+          else
+            local ok = safeWalkTo(pos, 3.5, 4.0)
+            if ok then
+              safeFirePrompt(pr)
+              lootedPrompts[pr] = true
+              task.wait(0.08)
+            end
+          end
         end
       end
     end
   end
 
-  local function handleGate(room)
+  local function handleGate(room, isSeekZone)
     local gate = room:FindFirstChild("Gate", true)
     local lever = room:FindFirstChild("LeverForGate", true)
     if gate and lever then
@@ -2473,7 +2681,11 @@ do
       if root then
         local leverPart = (lever:IsA("BasePart") and lever) or lever:FindFirstChildWhichIsA("BasePart", true) or lever.PrimaryPart
         if leverPart then
-          root.CFrame = leverPart.CFrame * CFrame.new(0, 0, 2.5)
+          if isSeekZone then
+            root.CFrame = leverPart.CFrame * CFrame.new(0, 0, 2.5)
+          else
+            safeWalkTo(leverPart.Position, 5.0, 4.0)
+          end
           local pr = lever:FindFirstChildWhichIsA("ProximityPrompt", true)
           if pr then
             safeFirePrompt(pr)
@@ -2484,11 +2696,11 @@ do
     end
   end
 
-  local function handleKeyAndUnlock(room, door)
+  local function handleKeyAndUnlock(room, door, isSeekZone)
     local char = localPlayer2.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
     local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not root then return end
+    if not root or not door then return end
 
     local lock = door:FindFirstChild("Lock") or door:FindFirstChild("UnlockPrompt", true)
     if not lock then return end
@@ -2523,7 +2735,11 @@ do
       if keyObj then
         local keyPos = (keyObj:IsA("BasePart") and keyObj.Position) or (keyObj:IsA("Model") and keyObj:GetPivot().Position)
         if keyPos then
-          root.CFrame = CFrame.new(keyPos + Vector3.new(0, 1.2, 0))
+          if isSeekZone then
+            root.CFrame = CFrame.new(keyPos + Vector3.new(0, 1.2, 0))
+          else
+            safeWalkTo(keyPos, 6.0, 4.0)
+          end
           local keyPrompt = keyObj:FindFirstChildWhichIsA("ProximityPrompt", true)
           if keyPrompt then
             safeFirePrompt(keyPrompt)
@@ -2545,7 +2761,11 @@ do
 
     local lockPart = (lock:IsA("BasePart") and lock) or lock:FindFirstChildWhichIsA("BasePart", true) or door:FindFirstChild("Door") or door.PrimaryPart
     if lockPart then
-      root.CFrame = lockPart.CFrame * CFrame.new(0, 0, 2.5)
+      if isSeekZone then
+        root.CFrame = lockPart.CFrame * CFrame.new(0, 0, 2.5)
+      else
+        safeWalkTo(lockPart.Position, 5.0, 4.0)
+      end
       if lockPrompt then
         safeFirePrompt(lockPrompt)
       end
@@ -2553,15 +2773,22 @@ do
     end
   end
 
-  local function openRoomDoor(door)
+  local function openRoomDoor(door, isSeekZone)
     local char = localPlayer2.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
     if not root or not door then return end
 
     local doorPart = door:FindFirstChild("Door") or door:FindFirstChild("Hidden") or door.PrimaryPart
-    if doorPart then
+    if not doorPart then return end
+
+    if isSeekZone then
+      -- On Seek: use instant door skip to bypass all obstacles, hands and debris!
       root.CFrame = doorPart.CFrame * CFrame.new(0, 0, 3)
+    else
+      -- Regular rooms: fast safe walking straight to door!
+      safeWalkTo(doorPart.Position, 6.0, 4.5)
     end
+
     local prompt = door:FindFirstChildWhichIsA("ProximityPrompt", true)
     if prompt then
       safeFirePrompt(prompt)
@@ -2650,7 +2877,7 @@ do
     end
 
     if door then
-      openRoomDoor(door)
+      openRoomDoor(door, true)
     end
   end
 
@@ -2691,7 +2918,7 @@ do
       end
     end
 
-    -- 2. Поднять все фигни (предохранители / fuses / breaker poles)
+    -- 2. Поднять все предохранители (FusePickup / FuseObtain / LiveBreakerPolePickup)
     for _, desc in ipairs(room:GetDescendants()) do
       local isFuse = desc.Name == "FusePickup" or desc.Name == "FuseObtain" or desc.Name == "Fuse" or desc.Name == "LiveBreakerPolePickup"
       if not isFuse and desc:IsA("ProximityPrompt") and (desc.ObjectText:lower():find("fuse") or desc.ActionText:lower():find("fuse")) then
@@ -2757,9 +2984,16 @@ do
   local lastProcessedRoom = nil
 
   task.spawn(function()
-    while task.wait(0.1) do
+    while task.wait(0.08) do
       if toggles.AutoDoorSkip and toggles.AutoDoorSkip.Value then
         pcall(function()
+          handleScreechAndEyes()
+
+          -- Physical Rush/Ambush check at any time
+          if HasRushAmbushBlitz() then
+            handleThreatHiding()
+          end
+
           local rep = game:GetService("ReplicatedStorage")
           local gameData = rep:FindFirstChild("GameData")
           local latestRoom = gameData and gameData:FindFirstChild("LatestRoom")
@@ -2771,20 +3005,21 @@ do
           local currentRoom = currentRooms and currentRooms:FindFirstChild(roomNum)
           if not currentRoom then return end
 
-          local door = currentRoom:FindFirstChild("Door")
+          local nextRoomNum = currentRoomNum + 1
+          local door = getRealDoor(currentRoom, nextRoomNum)
 
-          -- ROOM 50 LOGIC
+          -- ROOM 50 LOGIC (Figure)
           if (currentRoomNum == 50 or roomNum == "50") and toggles.AutoSkipSpecialRooms and toggles.AutoSkipSpecialRooms.Value then
             if lastProcessedRoom ~= roomNum then
               handleRoom50(currentRoom, door)
               lastProcessedRoom = roomNum
             else
-              if door then openRoomDoor(door) end
+              if door then openRoomDoor(door, true) end
             end
             return
           end
 
-          -- ROOM 100 LOGIC
+          -- ROOM 100 LOGIC (Electrical Breaker)
           if (currentRoomNum >= 100 or roomNum == "100") and toggles.AutoSkipSpecialRooms and toggles.AutoSkipSpecialRooms.Value then
             if lastProcessedRoom ~= roomNum then
               handleRoom100(currentRoom)
@@ -2793,26 +3028,18 @@ do
             return
           end
 
-          -- Check threat wait: ONLY in rooms 30-40 and 80-90 (Seek chase zones)
-          if isSeekThreatZone(currentRoom, currentRoomNum) and toggles.AutoSkipWaitThreats and toggles.AutoSkipWaitThreats.Value then
-            if HasRushAmbushBlitz() then
-              while HasRushAmbushBlitz() do
-                task.wait(0.3)
-              end
-              task.wait(0.5)
-            end
-          end
+          local inSeek = isSeekThreatZone(currentRoom, currentRoomNum)
 
           if not door then return end
 
           if lastProcessedRoom ~= roomNum then
             if toggles.AutoSkipFastLoot and toggles.AutoSkipFastLoot.Value then
-              fastLootRoom(currentRoom)
+              fastLootRoom(currentRoom, inSeek)
             end
 
             if toggles.AutoSkipUnlock and toggles.AutoSkipUnlock.Value then
-              handleGate(currentRoom)
-              handleKeyAndUnlock(currentRoom, door)
+              handleGate(currentRoom, inSeek)
+              handleKeyAndUnlock(currentRoom, door, inSeek)
             end
 
             lastProcessedRoom = roomNum
@@ -2820,22 +3047,12 @@ do
             if toggles.AutoSkipUnlock and toggles.AutoSkipUnlock.Value then
               local lock = door:FindFirstChild("Lock") or door:FindFirstChild("UnlockPrompt", true)
               if lock then
-                handleKeyAndUnlock(currentRoom, door)
+                handleKeyAndUnlock(currentRoom, door, inSeek)
               end
             end
           end
 
-          -- Threat wait before opening door in Seek zones
-          if isSeekThreatZone(currentRoom, currentRoomNum) and toggles.AutoSkipWaitThreats and toggles.AutoSkipWaitThreats.Value then
-            if HasRushAmbushBlitz() then
-              while HasRushAmbushBlitz() do
-                task.wait(0.3)
-              end
-              task.wait(0.5)
-            end
-          end
-
-          openRoomDoor(door)
+          openRoomDoor(door, inSeek)
         end)
       else
         lastProcessedRoom = nil
