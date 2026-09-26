@@ -12728,6 +12728,30 @@ GetPlayerCurrentRoom = function()
   local roomsFolder = workspace:FindFirstChild("CurrentRooms")
   if not roomsFolder then return nil, 0 end
 
+  -- 0. Check authoritative LatestRoom from game state
+  local gameRoomNum = nil
+  pcall(function()
+    if element2 and element2.Value then
+      gameRoomNum = tonumber(element2.Value)
+    end
+    if not gameRoomNum and localPlayer2 then
+      local attr = localPlayer2:GetAttribute("CurrentRoom")
+      if attr then gameRoomNum = tonumber(attr) end
+    end
+    if not gameRoomNum and replicatedStorage then
+      local gd = replicatedStorage:FindFirstChild("GameData") or replicatedStorage:FindFirstChild("FloorReplicated")
+      local lr = gd and gd:FindFirstChild("LatestRoom")
+      if lr and lr.Value then gameRoomNum = tonumber(lr.Value) end
+    end
+  end)
+
+  if gameRoomNum then
+    local r = roomsFolder:FindFirstChild(tostring(gameRoomNum))
+    if r then
+      return r, gameRoomNum
+    end
+  end
+
   local char = localPlayer2 and localPlayer2.Character
   local root = char and char:FindFirstChild("HumanoidRootPart")
   if not root then return nil, 0 end
@@ -12747,35 +12771,21 @@ GetPlayerCurrentRoom = function()
     end
   end
 
-  -- 2. Fallback: Find closest room
-  local bestRoom = nil
-  local bestDist = math.huge
-  local bestNum = 0
-
+  -- 2. Fallback: Find highest active room number in CurrentRooms
+  local maxNum = -1
+  local maxRoom = nil
   for _, r in ipairs(roomsFolder:GetChildren()) do
     local n = tonumber(r.Name)
-    if n then
-      local rPos = nil
-      local door = r:FindFirstChild("Door")
-      if door then
-        rPos = GetDoorCenter(door)
-      end
-      if not rPos then
-        local prim = (r:IsA("Model") and r.PrimaryPart) or r:FindFirstChildWhichIsA("BasePart", true)
-        if prim then rPos = prim.Position end
-      end
-      if rPos then
-        local dist = (root.Position - rPos).Magnitude
-        if dist < bestDist then
-          bestDist = dist
-          bestRoom = r
-          bestNum = n
-        end
-      end
+    if n and n > maxNum then
+      maxNum = n
+      maxRoom = r
     end
   end
+  if maxRoom then
+    return maxRoom, maxNum
+  end
 
-  return bestRoom, bestNum
+  return nil, 0
 end
 
 HasRoomGate = function(room)
@@ -12833,7 +12843,7 @@ HasLineOfSight = function(fromPos, toPos, ignoreModel)
 
   local rayParams = RaycastParams.new()
   rayParams.FilterType = Enum.RaycastFilterType.Exclude
-  local ignoreList = { localPlayer2 and localPlayer2.Character }
+  local ignoreList = { localPlayer2 and localPlayer2.Character, val85.HotelNodesFolder }
   if ignoreModel then
     table.insert(ignoreList, ignoreModel)
   end
@@ -12842,10 +12852,19 @@ HasLineOfSight = function(fromPos, toPos, ignoreModel)
   local result = workspace:Raycast(fromPos + Vector3.new(0, 1.2, 0), diff, rayParams)
   if not result then return true end
   local hitPart = result.Instance
-  if hitPart and (not hitPart.CanCollide or hitPart.Transparency >= 0.9) then
-    return true
+  if hitPart and not hitPart.CanCollide then
+    local remainder = diff - (result.Position - fromPos)
+    if remainder.Magnitude > 0.5 then
+      local secondResult = workspace:Raycast(result.Position + diff.Unit * 0.2, remainder, rayParams)
+      if not secondResult then return true end
+      if secondResult.Instance and secondResult.Instance.CanCollide then
+        return false
+      end
+    else
+      return true
+    end
   end
-  return (result.Position - (fromPos + Vector3.new(0, 1.2, 0))).Magnitude >= dist - 0.5
+  return false
 end
 
 PhaseTemporary = function(durationSeconds, targetPos)
@@ -12854,15 +12873,6 @@ PhaseTemporary = function(durationSeconds, targetPos)
   local root = char and char:FindFirstChild("HumanoidRootPart")
   local hum = char and char:FindFirstChildOfClass("Humanoid")
   if not root or not hum or hum.Health <= 0 then return end
-
-  Phase.TargetPosition = nil
-  Phase.Speed = nil
-
-  pcall(function()
-    if toggles.Phase and not toggles.Phase.Value then
-      toggles.Phase:SetValue(true)
-    end
-  end)
 
   local moveDir = nil
   if targetPos then
@@ -12877,21 +12887,23 @@ PhaseTemporary = function(durationSeconds, targetPos)
     moveDir = Vector3.new(fwd.X, 0, fwd.Z).Unit
   end
 
+  pcall(function()
+    for _, p in ipairs(char:GetChildren()) do
+      if p:IsA("BasePart") then p.CanCollide = false end
+    end
+  end)
+
+  if moveDir then
+    root.CFrame = CFrame.new(root.Position + moveDir * 2.5, root.Position + moveDir * 10)
+  end
+
   local t = tick()
-  local dur = durationSeconds or 2.0
+  local dur = durationSeconds or 1.2
   while (tick() - t < dur) and KnobFarm.Active and not _Unloading do
     hum:Move(moveDir, false)
     task.wait(0.05)
   end
   hum:Move(Vector3.zero, false)
-
-  pcall(function()
-    if toggles.Phase and toggles.Phase.Value then
-      toggles.Phase:SetValue(false)
-    end
-    Phase.TargetPosition = nil
-    Phase.Speed = nil
-  end)
 end
 
 TeleportLootRoom = function(room, returnToOrigin)
@@ -13336,16 +13348,9 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
       end
     end
 
-    -- Steering target
+    -- Steering target: follow waypoints sequentially to cleanly round corners
     local curWp = waypoints[wpIndex]
     local targetPoint = (curWp and curWp.Position) or targetPos
-
-    if curWp and wpIndex < #waypoints then
-      local nextWp = waypoints[wpIndex + 1]
-      if nextWp and HasLineOfSight(rootPos, nextWp.Position) then
-        targetPoint = nextWp.Position
-      end
-    end
     currentTargetPoint = targetPoint
 
     local steerX = targetPoint.X - rootPos.X
@@ -13448,43 +13453,20 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
           end)
         end
 
+        -- Instant unstick: disable char collision and nudge forward along path
         pcall(function()
-          if toggles.Phase and not toggles.Phase.Value then
-            toggles.Phase:SetValue(true)
+          for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
           end
         end)
 
-        local stuckStartPos = root.Position
-        local phaseStart = tick()
-        while tick() - phaseStart < 2.5 and KnobFarm.Active and not _Unloading do
-          local distToTarget = (targetPoint - root.Position).Magnitude
-          local distFromStuck = (root.Position - stuckStartPos).Magnitude
-          if distFromStuck > 3.5 or distToTarget < 2.5 then
-            break
-          end
+        if targetPoint and root then
           local dir = (targetPoint - root.Position)
           local flatDir = Vector3.new(dir.X, 0, dir.Z)
-          if flatDir.Magnitude > 0.1 then
-            hum:Move(flatDir.Unit, false)
-            pcall(function()
-              local cam = workspace.CurrentCamera
-              if cam and targetPoint then
-                local camPos = cam.CFrame.Position
-                local lookTarget = Vector3.new(targetPoint.X, camPos.Y, targetPoint.Z)
-                cam.CFrame = cam.CFrame:Lerp(CFrame.new(camPos, lookTarget), 0.2)
-              end
-            end)
+          if flatDir.Magnitude > 0.5 then
+            root.CFrame = CFrame.new(root.Position + flatDir.Unit * 2.5, root.Position + flatDir.Unit * 10)
           end
-          task.wait(0.05)
         end
-
-        pcall(function()
-          if toggles.Phase and toggles.Phase.Value then
-            toggles.Phase:SetValue(false)
-          end
-          Phase.TargetPosition = nil
-          Phase.Speed = nil
-        end)
 
         if targetType == "Drawer" and tick() - lastProgressTime > 3.0 then
           break
@@ -13570,38 +13552,43 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
 
     -- Step cleanly through doorway into next room (8-10 studs forward)
     if root and hum and not IsUserMovingManually() then
-      local passDir = nil
-      local staticPart = target:FindFirstChild("Hidden")
-        or target:FindFirstChild("DoorFrame")
-        or target:FindFirstChild("Frame")
-        or target:FindFirstChild("Sign")
-        or (target:IsA("Model") and target.PrimaryPart)
-        or (target:IsA("BasePart") and target)
-      local cf = staticPart and staticPart:IsA("BasePart") and staticPart.CFrame
-      if not cf and target:IsA("Model") then
-        local ok, piv = pcall(function() return target:GetPivot() end)
-        if ok and piv then cf = piv end
-      end
       local doorCenter = GetDoorCenter(target)
-      if doorCenter and root.Position then
-        local diff = (doorCenter - root.Position)
+      local throughDir = nil
+
+      if doorCenter and targetPos then
+        local diff = (doorCenter - targetPos)
         local flat = Vector3.new(diff.X, 0, diff.Z)
         if flat.Magnitude > 0.2 then
-          passDir = flat.Unit
+          throughDir = flat.Unit
         end
       end
-      if not passDir and cf and typeof(cf) == "CFrame" then
-        local flatLv = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
-        if flatLv.Magnitude > 0.2 then
-          local normal = flatLv.Unit
-          local toPlayer = Vector3.new(root.Position.X - targetPos.X, 0, root.Position.Z - targetPos.Z)
-          local side = toPlayer:Dot(normal) >= 0 and 1 or -1
-          passDir = normal * (-side)
+
+      if not throughDir then
+        local staticPart = target:FindFirstChild("Hidden")
+          or target:FindFirstChild("DoorFrame")
+          or target:FindFirstChild("Frame")
+          or target:FindFirstChild("Sign")
+          or (target:IsA("Model") and target.PrimaryPart)
+          or (target:IsA("BasePart") and target)
+        local cf = staticPart and staticPart:IsA("BasePart") and staticPart.CFrame
+        if not cf and target:IsA("Model") then
+          local ok, piv = pcall(function() return target:GetPivot() end)
+          if ok and piv then cf = piv end
+        end
+        if cf and typeof(cf) == "CFrame" and doorCenter then
+          local flatLv = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+          if flatLv.Magnitude > 0.2 then
+            local normal = flatLv.Unit
+            local toPlayer = Vector3.new(root.Position.X - doorCenter.X, 0, root.Position.Z - doorCenter.Z)
+            local side = toPlayer:Dot(normal) >= 0 and 1 or -1
+            throughDir = normal * (-side)
+          end
         end
       end
-      if not passDir then
+
+      if not throughDir then
         local fwd = root.CFrame.LookVector
-        passDir = Vector3.new(fwd.X, 0, fwd.Z).Unit
+        throughDir = Vector3.new(fwd.X, 0, fwd.Z).Unit
       end
 
       -- Uncollide all door parts
@@ -13615,12 +13602,12 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
 
       local passStart = tick()
       while tick() - passStart < 0.75 and KnobFarm.Active and not _Unloading do
-        hum:Move(passDir, false)
+        hum:Move(throughDir, false)
         pcall(function()
           local cam = workspace.CurrentCamera
-          if cam and passDir and passDir.Magnitude > 0.1 then
+          if cam and throughDir and throughDir.Magnitude > 0.1 then
             local camPos = cam.CFrame.Position
-            local lookTarget = camPos + Vector3.new(passDir.X, 0, passDir.Z)
+            local lookTarget = camPos + Vector3.new(throughDir.X, 0, throughDir.Z)
             cam.CFrame = cam.CFrame:Lerp(CFrame.new(camPos, lookTarget), 0.2)
           end
         end)
@@ -13630,7 +13617,7 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
 
       -- Nudge 6 studs past doorCenter into next room if still near doorway
       if doorCenter and (root.Position - doorCenter).Magnitude < 4.0 then
-        root.CFrame = CFrame.new(doorCenter + passDir * 6)
+        root.CFrame = CFrame.new(doorCenter + throughDir * 6)
       end
     end
   end
@@ -13712,18 +13699,19 @@ NavigateTo = function(targetPos, targetInstance, label, maxWaitTime, targetType)
         break
       end
 
-      -- If hindered for over 0.8s, temporarily activate Phase to pass obstacles
+      -- If hindered for over 0.8s, temporarily uncollide and nudge towards floorPos
       if tick() - t > 0.8 then
         pcall(function()
-          if toggles.Phase and not toggles.Phase.Value then
-            toggles.Phase:SetValue(true)
+          for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
           end
         end)
         local dir = (floorPos - root.Position)
         local flat = Vector3.new(dir.X, 0, dir.Z)
-        if flat.Magnitude > 0.1 then
-          hum:Move(flat.Unit, false)
+        if flat.Magnitude > 0.5 then
+          root.CFrame = CFrame.new(root.Position + flat.Unit * 1.5, root.Position + flat.Unit * 10)
         end
+        hum:MoveTo(floorPos)
       end
 
       pcall(function()
@@ -13736,11 +13724,6 @@ NavigateTo = function(targetPos, targetInstance, label, maxWaitTime, targetType)
       end)
       task.wait(0.05)
     end
-    pcall(function()
-      if toggles.Phase and toggles.Phase.Value then
-        toggles.Phase:SetValue(false)
-      end
-    end)
     hum:Move(Vector3.zero, false)
   end
   return true
