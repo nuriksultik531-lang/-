@@ -2696,25 +2696,46 @@ do
     end
   end
 
+  local function getDoorLock(door)
+    if not door then return nil end
+    local lock = door:FindFirstChild("Lock", true)
+    if lock then return lock end
+    local unlockPrompt = door:FindFirstChild("UnlockPrompt", true)
+    if unlockPrompt then return unlockPrompt end
+    for _, desc in ipairs(door:GetDescendants()) do
+      if desc:IsA("ProximityPrompt") and (desc.Name == "UnlockPrompt" or desc.ActionText:lower():find("unlock") or desc.ObjectText:lower():find("lock")) then
+        return desc
+      end
+    end
+    if door:GetAttribute("Locked") == true then
+      return door
+    end
+    return nil
+  end
+
   local function handleKeyAndUnlock(room, door, isSeekZone)
     local char = localPlayer2.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
     local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not root or not door then return end
+    if not root or not hum or not door then return false end
 
-    local lock = door:FindFirstChild("Lock") or door:FindFirstChild("UnlockPrompt", true)
-    if not lock then return end
+    local lock = getDoorLock(door)
+    if not lock then return true end -- Already unlocked!
 
     local function getKeyTool()
-      if char:FindFirstChild("Key") then return char:FindFirstChild("Key") end
-      local bp = localPlayer2:FindFirstChildOfClass("Backpack")
-      if bp and bp:FindFirstChild("Key") then return bp:FindFirstChild("Key") end
-      for _, item in ipairs(char:GetChildren()) do
-        if item:IsA("Tool") and item.Name:lower():find("key") then return item end
+      if char then
+        for _, item in ipairs(char:GetChildren()) do
+          if item:IsA("Tool") and (item.Name:lower():find("key") or item:GetAttribute("Key") or item.Name == "Key") then
+            return item
+          end
+        end
       end
+      local bp = localPlayer2:FindFirstChildOfClass("Backpack")
       if bp then
         for _, item in ipairs(bp:GetChildren()) do
-          if item:IsA("Tool") and item.Name:lower():find("key") then return item end
+          if item:IsA("Tool") and (item.Name:lower():find("key") or item:GetAttribute("Key") or item.Name == "Key") then
+            return item
+          end
         end
       end
       return nil
@@ -2722,55 +2743,93 @@ do
 
     local keyTool = getKeyTool()
     if not keyTool then
-      local keyObj = room:FindFirstChild("KeyObtain", true) or room:FindFirstChild("Key", true)
-      if not keyObj then
-        for _, pr in ipairs(room:GetDescendants()) do
-          if pr:IsA("ProximityPrompt") and (pr.ObjectText:lower():find("key") or pr.Name:lower():find("key")) then
-            keyObj = pr.Parent
+      local keyObj = nil
+      local keyPrompt = nil
+
+      -- Pass 1: Look for KeyObtain or Key models
+      for _, desc in ipairs(room:GetDescendants()) do
+        if not desc:IsDescendantOf(door) then
+          if desc.Name == "KeyObtain" or desc.Name == "Key" or desc.Name == "KeyIron" then
+            keyObj = desc
+            keyPrompt = desc:FindFirstChildWhichIsA("ProximityPrompt", true) or (desc:IsA("ProximityPrompt") and desc)
             break
           end
         end
       end
 
-      if keyObj then
-        local keyPos = (keyObj:IsA("BasePart") and keyObj.Position) or (keyObj:IsA("Model") and keyObj:GetPivot().Position)
+      -- Pass 2: Look for any prompt with 'key' in text
+      if not keyPrompt then
+        for _, desc in ipairs(room:GetDescendants()) do
+          if not desc:IsDescendantOf(door) and desc:IsA("ProximityPrompt") and desc.Enabled then
+            local objT = desc.ObjectText:lower()
+            local actT = desc.ActionText:lower()
+            if objT:find("key") or actT:find("key") or desc.Name:lower():find("key") then
+              keyPrompt = desc
+              keyObj = desc.Parent
+              break
+            end
+          end
+        end
+      end
+
+      if keyObj or keyPrompt then
+        local keyPos = nil
+        if keyObj then
+          keyPos = (keyObj:IsA("BasePart") and keyObj.Position) or (keyObj:IsA("Model") and keyObj:GetPivot().Position)
+        end
+        if not keyPos and keyPrompt then
+          keyPos = getPromptPos(keyPrompt)
+        end
+
         if keyPos then
           if isSeekZone then
             root.CFrame = CFrame.new(keyPos + Vector3.new(0, 1.2, 0))
           else
-            safeWalkTo(keyPos, 6.0, 4.0)
+            safeWalkTo(keyPos, 7.0, 3.5)
           end
-          local keyPrompt = keyObj:FindFirstChildWhichIsA("ProximityPrompt", true)
           if keyPrompt then
             safeFirePrompt(keyPrompt)
           end
-          task.wait(0.25)
+          task.wait(0.3)
         end
       end
+
       keyTool = getKeyTool()
     end
 
-    if keyTool and hum and keyTool.Parent ~= char then
-      pcall(function() hum:EquipTool(keyTool) end)
-      task.wait(0.15)
+    -- If player has key, equip it and walk to unlock!
+    if keyTool then
+      if hum and keyTool.Parent ~= char then
+        pcall(function() hum:EquipTool(keyTool) end)
+        task.wait(0.15)
+      end
+
+      local lockPrompt = (lock:IsA("ProximityPrompt") and lock)
+        or door:FindFirstChild("UnlockPrompt", true)
+        or lock:FindFirstChildWhichIsA("ProximityPrompt", true)
+
+      local lockPart = (lock:IsA("BasePart") and lock)
+        or (lock:IsA("Model") and lock.PrimaryPart)
+        or lock:FindFirstChildWhichIsA("BasePart", true)
+        or door:FindFirstChild("Door")
+        or door.PrimaryPart
+
+      if lockPart then
+        if isSeekZone then
+          root.CFrame = lockPart.CFrame * CFrame.new(0, 0, 2.5)
+        else
+          safeWalkTo(lockPart.Position, 6.0, 3.5)
+        end
+        if lockPrompt then
+          safeFirePrompt(lockPrompt)
+        end
+        task.wait(0.3)
+      end
+
+      return (getDoorLock(door) == nil)
     end
 
-    local lockPrompt = door:FindFirstChild("UnlockPrompt", true)
-      or (lock:IsA("ProximityPrompt") and lock)
-      or lock:FindFirstChildWhichIsA("ProximityPrompt", true)
-
-    local lockPart = (lock:IsA("BasePart") and lock) or lock:FindFirstChildWhichIsA("BasePart", true) or door:FindFirstChild("Door") or door.PrimaryPart
-    if lockPart then
-      if isSeekZone then
-        root.CFrame = lockPart.CFrame * CFrame.new(0, 0, 2.5)
-      else
-        safeWalkTo(lockPart.Position, 5.0, 4.0)
-      end
-      if lockPrompt then
-        safeFirePrompt(lockPrompt)
-      end
-      task.wait(0.2)
-    end
+    return false
   end
 
   local function openRoomDoor(door, isSeekZone)
@@ -3032,26 +3091,32 @@ do
 
           if not door then return end
 
+          -- 1. Handle gate lever if present
+          if toggles.AutoSkipUnlock and toggles.AutoSkipUnlock.Value then
+            handleGate(currentRoom, inSeek)
+          end
+
+          -- 2. Check if door is locked!
+          local lock = getDoorLock(door)
+          if lock and toggles.AutoSkipUnlock and toggles.AutoSkipUnlock.Value then
+            -- STOP! The door is locked. Find key and unlock it first!
+            -- Do NOT charge forward into the closed door!
+            local unlocked = handleKeyAndUnlock(currentRoom, door, inSeek)
+            if not unlocked then
+              -- Still locked, do NOT run into the door! Wait for key/unlock.
+              return
+            end
+          end
+
+          -- 3. Loot room (only once per room)
           if lastProcessedRoom ~= roomNum then
             if toggles.AutoSkipFastLoot and toggles.AutoSkipFastLoot.Value then
               fastLootRoom(currentRoom, inSeek)
             end
-
-            if toggles.AutoSkipUnlock and toggles.AutoSkipUnlock.Value then
-              handleGate(currentRoom, inSeek)
-              handleKeyAndUnlock(currentRoom, door, inSeek)
-            end
-
             lastProcessedRoom = roomNum
-          else
-            if toggles.AutoSkipUnlock and toggles.AutoSkipUnlock.Value then
-              local lock = door:FindFirstChild("Lock") or door:FindFirstChild("UnlockPrompt", true)
-              if lock then
-                handleKeyAndUnlock(currentRoom, door, inSeek)
-              end
-            end
           end
 
+          -- 4. Door is confirmed open/unlocked! Now proceed through.
           openRoomDoor(door, inSeek)
         end)
       else
