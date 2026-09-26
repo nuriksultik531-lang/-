@@ -2225,8 +2225,8 @@ Groupboxes.AutoFarm_Settings:AddSlider("AutoFarmWalkSpeed", {
 
 Groupboxes.AutoFarm_Settings:AddToggle("AutoFarmLootDrawers", {
   Text = "Loot Drawers & Tables",
-  Default = false,
-  Tooltip = "Visits nearby drawers, chests, and tables to collect gold (Disabled by default)",
+  Default = true,
+  Tooltip = "Visits nearby drawers, chests, and tables to collect gold",
 })
 
 Groupboxes.AutoFarm_Settings:AddToggle("AutoFarmRunTo100", {
@@ -12479,20 +12479,31 @@ ResolveKeyAndUnlock = function(room, exitDoor, roomNum)
 
     local keyObj, keyPos, keyPr = FindRoomKey(room)
 
-    -- If key not found immediately, retry scanning the room (keys spawn on open surfaces)
+    -- If not immediately on tables/shelves, inspect drawers & containers
     if not keyObj then
-      for retry = 1, 5 do
-        task.wait(0.15)
-        keyObj, keyPos, keyPr = FindRoomKey(room)
-        if keyObj then break end
+      KnobFarm.SetStatus("Room " .. tostring(roomNum) .. ": Checking drawers for key...")
+      local drawers = LootDrawersInRoom(room)
+      for _, d in ipairs(drawers) do
+        if not KnobFarm.Active or _Unloading or hum.Health <= 0 then break end
+        if HasRushAmbushBlitz and HasRushAmbushBlitz() then handleThreatHiding() end
+
+        if d.prompt and d.prompt.Enabled and not KnobFarm.LootedObjects[d.parent] then
+          NavigateTo(d.pos, d.parent, "Container", 4.0, "Drawer")
+          TriggerPrompt(d.prompt)
+          KnobFarm.LootedObjects[d.parent] = true
+          task.wait(0.1)
+
+          keyObj, keyPos, keyPr = FindRoomKey(room)
+          if keyObj then break end
+        end
       end
     end
 
-    -- Navigate directly to the key along orthogonal center path and pick it up
+    -- Navigate directly to the key and pick it up
     if keyObj and keyPos then
       KnobFarm.SetStatus("Room " .. tostring(roomNum) .. ": Walking to Key...")
       DisableObstacleCollision(room)
-      NavigateTo(keyPos, keyObj, "Key", 6.0, "Key", room, roomNum)
+      NavigateTo(keyPos, keyObj, "Key", 6.0, "Key")
       task.wait(0.05)
 
       for attempt = 1, 5 do
@@ -12801,10 +12812,10 @@ DisableObstacleCollision = function(room)
     "plant", "pot", "bush", "flower", "fern", "leaf", "leaves", "foliage", "vase", "bonsai",
     "hedge", "cactus", "shrub", "vine", "tree", "planter", "table", "chair", "desk", "stool",
     "bench", "couch", "sofa", "shelf", "cart", "luggage", "stand", "dresser", "nightstand",
-    "prop", "furniture", "carpet", "rug", "trash", "bin", "lamp", "bed", "headboard", "mattress",
-    "bedpost", "footboard", "partition", "wardrobe", "closet", "locker", "clock", "grandfather",
-    "cabinet", "cupboard", "sideboard", "bookcase", "bookshelf", "curtain", "drapes", "pillar",
-    "column", "statue", "pedestal", "chandelier", "painting", "frame", "mirror", "drawer"
+    "prop", "furniture", "carpet", "rug", "trash", "bin", "lamp", "bed",
+    "wardrobe", "closet", "locker", "clock", "grandfather", "cabinet", "cupboard", "sideboard",
+    "bookcase", "bookshelf", "curtain", "drapes", "pillar", "column", "statue", "pedestal",
+    "chandelier", "painting", "frame", "mirror", "drawer"
   }
   pcall(function()
     for _, desc in ipairs(room:GetDescendants()) do
@@ -12938,8 +12949,23 @@ TeleportLootRoom = function(room, returnToOrigin)
 end
 
 LootDrawersInRoom = function(room)
-  -- Completely disabled per user request: bot never approaches drawers, chests, or tables
-  return {}
+  if not room or not KnobFarm.Active or _Unloading then return {} end
+  local targets = {}
+  for _, desc in ipairs(room:GetDescendants()) do
+    if desc:IsA("ProximityPrompt") and desc.Enabled and not KnobFarm.LootedObjects[desc.Parent] then
+      local parent = desc.Parent
+      if parent then
+        local pName = parent.Name
+        if (pName == "ChestBox" or pName == "ChestBoxLocked" or pName == "Toolbox" or pName == "Toolbox_Locked" or pName == "Toolshed_Small" or pName:find("Drawer", 1, true) or (pName:find("Chest", 1, true) and pName:lower():find("locked", 1, true))) then
+          local pos = GetInstancePosition(parent)
+          if pos then
+            table.insert(targets, { prompt = desc, pos = pos, parent = parent })
+          end
+        end
+      end
+    end
+  end
+  return targets
 end
 
 local THREAT_NAMES = {
@@ -13295,7 +13321,7 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
       local dz = curPos.Z - rootPos.Z
       local flatDist = math.sqrt(dx * dx + dz * dz)
 
-      if flatDist < 2.0 then
+      if flatDist < 2.4 then
         if currentNodes[wpIndex] and currentNodes[wpIndex].Parent then
           pcall(function() currentNodes[wpIndex]:Destroy() end)
           currentNodes[wpIndex] = nil
@@ -13303,14 +13329,13 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
         wpIndex = wpIndex + 1
       else
         local nextWp = waypoints[wpIndex + 1]
-        if nextWp then
-          local segX = nextWp.Position.X - curPos.X
-          local segZ = nextWp.Position.Z - curPos.Z
+        if nextWp and flatDist < 4.5 then
+          local nextPos = nextWp.Position
+          local segX = nextPos.X - curPos.X
+          local segZ = nextPos.Z - curPos.Z
           local pastX = rootPos.X - curPos.X
           local pastZ = rootPos.Z - curPos.Z
-          local segLenSq = segX * segX + segZ * segZ
-          -- Only advance if the character has completely passed the current waypoint
-          if segLenSq > 0.04 and (pastX * segX + pastZ * segZ) > segLenSq then
+          if (pastX * segX + pastZ * segZ) > 0 and HasLineOfSight(rootPos, nextPos) then
             if currentNodes[wpIndex] and currentNodes[wpIndex].Parent then
               pcall(function() currentNodes[wpIndex]:Destroy() end)
               currentNodes[wpIndex] = nil
@@ -13421,7 +13446,7 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
       if moved > 1.2 then
         lastRootPos = root.Position
         lastProgressTime = tick()
-      elseif tick() - lastProgressTime > 1.4 then
+      elseif tick() - lastProgressTime > 2.8 then
         local targetPoint = currentTargetPoint or targetPos
         local cam = workspace.CurrentCamera
         if cam and targetPoint then
@@ -13430,20 +13455,21 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
           end)
         end
 
-        if room then
-          pcall(function() DisableObstacleCollision(room) end)
-        end
-
-        -- Unstick: micro-hop and advance waypoint
+        -- Unstick: micro-hop and advance waypoint rather than blind teleporting into walls
         pcall(function()
           hum.Jump = true
+          for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+          end
         end)
 
         if wpIndex < #waypoints then
           wpIndex = wpIndex + 1
         end
 
-        if tick() - lastProgressTime > 3.2 then
+        if targetType == "Drawer" and tick() - lastProgressTime > 3.0 then
+          break
+        elseif tick() - lastProgressTime > 4.5 then
           break
         end
         lastRootPos = root.Position
@@ -13604,200 +13630,6 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
   return completed and not IsUserMovingManually()
 end
 
--- Builds an orthogonal path running down the exact center line of the room
--- strictly along mutually perpendicular lines (90° right angles), completely clear of all side furniture
-local function BuildOrthogonalCenterPath(startPos, endPos, room)
-  if not room then return nil end
-  local ok, roomCF, roomSize = pcall(function() return room:GetBoundingBox() end)
-  if not ok or not roomCF or not roomSize then
-    local piv = (room:IsA("Model") and room:GetPivot()) or CFrame.new(startPos)
-    roomCF = piv
-    roomSize = Vector3.new(30, 15, 60)
-  end
-
-  local startLocal = roomCF:PointToObjectSpace(startPos)
-  local endLocal = roomCF:PointToObjectSpace(endPos)
-
-  local dx = endLocal.X - startLocal.X
-  local dz = endLocal.Z - startLocal.Z
-  local totalDist = math.sqrt(dx * dx + dz * dz)
-  if totalDist < 3.5 then
-    return nil
-  end
-
-  local points = {}
-  table.insert(points, startLocal)
-
-  -- In DOORS rooms, the primary corridor axis runs along Z or X.
-  -- Compare |dz| vs |dx| to determine corridor transit axis:
-  local alongZ = math.abs(dz) >= math.abs(dx)
-
-  if alongZ then
-    -- Corridor runs along Z axis.
-    -- Candidate center lines:
-    -- 1. Midpoint between start and end doors: (startLocal.X + endLocal.X) / 2
-    -- 2. Exit door axis: endLocal.X
-    -- 3. Entrance door axis: startLocal.X
-    -- 4. Bounding box center: 0
-    local candidates = {
-      (startLocal.X + endLocal.X) / 2,
-      endLocal.X,
-      startLocal.X,
-      0
-    }
-
-    local bestX = candidates[1]
-    for _, cX in ipairs(candidates) do
-      local p1Local = Vector3.new(cX, startLocal.Y, startLocal.Z)
-      local p2Local = Vector3.new(cX, endLocal.Y, endLocal.Z)
-      local p1World = roomCF:PointToWorldSpace(p1Local)
-      local p2World = roomCF:PointToWorldSpace(p2Local)
-      local fl1 = GetFloorPosition(p1World)
-      local fl2 = GetFloorPosition(p2World)
-      if fl1 and fl2 and HasLineOfSight(fl1, fl2, room) then
-        bestX = cX
-        break
-      end
-    end
-
-    local corridorX = bestX
-
-    -- Leg 1: Perpendicular move from start position to corridor center line
-    if math.abs(startLocal.X - corridorX) > 0.8 then
-      table.insert(points, Vector3.new(corridorX, startLocal.Y, startLocal.Z))
-    end
-    -- Leg 2: Longitudinal transit straight down the center line of the corridor
-    table.insert(points, Vector3.new(corridorX, (startLocal.Y + endLocal.Y) / 2, endLocal.Z))
-    -- Leg 3: Perpendicular move from corridor center line to end position (target X)
-    if math.abs(endLocal.X - corridorX) > 0.8 then
-      table.insert(points, Vector3.new(endLocal.X, endLocal.Y, endLocal.Z))
-    end
-  else
-    -- Corridor runs along X axis.
-    local candidates = {
-      (startLocal.Z + endLocal.Z) / 2,
-      endLocal.Z,
-      startLocal.Z,
-      0
-    }
-
-    local bestZ = candidates[1]
-    for _, cZ in ipairs(candidates) do
-      local p1Local = Vector3.new(startLocal.X, startLocal.Y, cZ)
-      local p2Local = Vector3.new(endLocal.X, endLocal.Y, cZ)
-      local p1World = roomCF:PointToWorldSpace(p1Local)
-      local p2World = roomCF:PointToWorldSpace(p2Local)
-      local fl1 = GetFloorPosition(p1World)
-      local fl2 = GetFloorPosition(p2World)
-      if fl1 and fl2 and HasLineOfSight(fl1, fl2, room) then
-        bestZ = cZ
-        break
-      end
-    end
-
-    local corridorZ = bestZ
-
-    -- Leg 1: Perpendicular move from start position to corridor center line
-    if math.abs(startLocal.Z - corridorZ) > 0.8 then
-      table.insert(points, Vector3.new(startLocal.X, startLocal.Y, corridorZ))
-    end
-    -- Leg 2: Longitudinal transit straight down the center line of the corridor
-    table.insert(points, Vector3.new(endLocal.X, (startLocal.Y + endLocal.Y) / 2, corridorZ))
-    -- Leg 3: Perpendicular move from corridor center line to end position (target Z)
-    if math.abs(endLocal.Z - corridorZ) > 0.8 then
-      table.insert(points, Vector3.new(endLocal.X, endLocal.Y, endLocal.Z))
-    end
-  end
-
-  -- Subdivide into dense waypoints spaced ~2.5 studs apart, snapped to floor
-  local waypoints = {}
-  local stepSize = 2.5
-
-  for i = 1, #points - 1 do
-    local pA = points[i]
-    local pB = points[i + 1]
-    local segVec = pB - pA
-    local segLen = segVec.Magnitude
-    local steps = math.max(1, math.ceil(segLen / stepSize))
-
-    for s = (i == 1 and 0 or 1), steps do
-      local alpha = s / steps
-      local localPos = pA:Lerp(pB, alpha)
-      local worldPos = roomCF:PointToWorldSpace(localPos)
-      local fl = GetFloorPosition(worldPos) or worldPos
-      table.insert(waypoints, PathWaypoint.new(fl, Enum.PathWaypointAction.Walk))
-    end
-  end
-
-  -- Ensure target destination is included at the end
-  if #waypoints > 0 then
-    local lastWpPos = waypoints[#waypoints].Position
-    local dEnd = (lastWpPos - endPos).Magnitude
-    if dEnd > 1.2 then
-      table.insert(waypoints, PathWaypoint.new(endPos, Enum.PathWaypointAction.Walk))
-    end
-  end
-
-  -- Verify line-of-sight along the center path so no wall or obstacle blocks it
-  if #waypoints >= 2 then
-    local stepCheck = math.max(1, math.floor(#waypoints / 5))
-    local clear = true
-    for idx = 1, #waypoints - stepCheck, stepCheck do
-      local w1 = waypoints[idx].Position
-      local w2 = waypoints[idx + stepCheck].Position
-      if not HasLineOfSight(w1, w2, room) then
-        clear = false
-        break
-      end
-    end
-    if clear then
-      return waypoints
-    end
-  end
-
-  return nil
-end
-
--- Converts diagonal pathfinding waypoints into mutually perpendicular orthogonal steps
-local function OrthogonalizeWaypoints(rawWps, room)
-  if not rawWps or #rawWps <= 2 or not room then return rawWps end
-  local ok, roomCF = pcall(function() return room:GetBoundingBox() end)
-  if not ok or not roomCF then
-    local piv = room:IsA("Model") and room:GetPivot()
-    if piv then roomCF = piv else return rawWps end
-  end
-
-  local orthoWps = {}
-  table.insert(orthoWps, rawWps[1])
-
-  for i = 1, #rawWps - 1 do
-    local cur = rawWps[i]
-    local nxt = rawWps[i + 1]
-    local pA = roomCF:PointToObjectSpace(cur.Position)
-    local pB = roomCF:PointToObjectSpace(nxt.Position)
-    local dx = pB.X - pA.X
-    local dz = pB.Z - pA.Z
-
-    if math.abs(dx) > 1.8 and math.abs(dz) > 1.8 then
-      local c1Local = Vector3.new(pB.X, (pA.Y + pB.Y) / 2, pA.Z)
-      local c2Local = Vector3.new(pA.X, (pA.Y + pB.Y) / 2, pB.Z)
-      local wC1 = roomCF:PointToWorldSpace(c1Local)
-      local wC2 = roomCF:PointToWorldSpace(c2Local)
-
-      local pickWorld = (math.abs(c1Local.X) < math.abs(c2Local.X)) and wC1 or wC2
-      if not HasLineOfSight(cur.Position, pickWorld, room) then
-        pickWorld = (pickWorld == wC1) and wC2 or wC1
-      end
-
-      local fl = GetFloorPosition(pickWorld) or pickWorld
-      table.insert(orthoWps, PathWaypoint.new(fl, Enum.PathWaypointAction.Walk))
-    end
-    table.insert(orthoWps, nxt)
-  end
-
-  return orthoWps
-end
-
 NavigateTo = function(targetPos, targetInstance, label, maxWaitTime, targetType, room, roomNum)
   if not targetPos or not KnobFarm.Active or _Unloading then return false end
   local char = localPlayer2 and localPlayer2.Character
@@ -13833,20 +13665,6 @@ NavigateTo = function(targetPos, targetInstance, label, maxWaitTime, targetType,
   local reachThresh = (targetType == "Door" and 3.5) or (targetType == "Key" and 3.5) or 4.5
   if currentDist <= reachThresh then
     return true
-  end
-
-  local activeRoom = room
-  if not activeRoom then
-    activeRoom = GetPlayerCurrentRoom()
-  end
-
-  -- Primary navigation: strictly along mutually perpendicular lines through the room center (localX = 0)
-  -- Moves down the central corridor, completely clear of all side furniture, drawers, bedside tables
-  if activeRoom and (targetType == "Door" or targetType == "Key" or not targetType) then
-    local orthoWps = BuildOrthogonalCenterPath(root.Position, floorPos, activeRoom)
-    if orthoWps and #orthoWps >= 2 then
-      return FollowPath(orthoWps, targetInstance, floorPos, targetType or label or "Target", activeRoom, roomNum or KnobFarm.CurrentRoomNum)
-    end
   end
 
   -- Helper to attempt path computation
@@ -13916,16 +13734,14 @@ NavigateTo = function(targetPos, targetInstance, label, maxWaitTime, targetType,
           local combined = {}
           for _, wp in ipairs(p1:GetWaypoints()) do table.insert(combined, wp) end
           for _, wp in ipairs(p2:GetWaypoints()) do table.insert(combined, wp) end
-          local ortho = OrthogonalizeWaypoints(combined, activeRoom or room)
-          return FollowPath(ortho, targetInstance, floorPos, targetType or label or "Target", room, roomNum or KnobFarm.CurrentRoomNum)
+          return FollowPath(combined, targetInstance, floorPos, targetType or label or "Target", room, roomNum or KnobFarm.CurrentRoomNum)
         end
       end
     end
   end
 
   if path and path.Status == Enum.PathStatus.Success then
-    local ortho = OrthogonalizeWaypoints(path:GetWaypoints(), activeRoom or room)
-    return FollowPath(ortho, targetInstance, floorPos, targetType or label or "Target", room, roomNum or KnobFarm.CurrentRoomNum)
+    return FollowPath(path:GetWaypoints(), targetInstance, floorPos, targetType or label or "Target", room, roomNum or KnobFarm.CurrentRoomNum)
   end
 
   -- Fallback when pathfinding has no valid path:
@@ -14472,7 +14288,28 @@ function KnobFarm.RunLoop()
         end
       end
 
-      -- 14. Drawer/container looting disabled: bot moves directly along room center to exit door
+      -- 14. Optional: Loot Drawers / Containers (if setting enabled)
+      if options and options.AutoFarmLootDrawers and options.AutoFarmLootDrawers.Value then
+        local drawers = LootDrawersInRoom(room)
+        if drawers and #drawers > 0 then
+          for _, drawer in ipairs(drawers) do
+            if not KnobFarm.Active or _Unloading then break end
+            handleScreechAndEyes()
+            if HasRushAmbushBlitz() then handleThreatHiding() end
+
+            if drawer.prompt and drawer.prompt.Enabled and not KnobFarm.LootedObjects[drawer.parent] then
+              NavigateTo(drawer.pos, drawer.parent, drawer.parent.Name, 4.0, "Drawer")
+              if drawer.parent.Name:lower():find("locked", 1, true) then
+                EquipUnlockTool()
+              end
+              TriggerPrompt(drawer.prompt)
+              KnobFarm.LootedObjects[drawer.parent] = true
+              task.wait(0.06)
+              TeleportLootRoom(room, false)
+            end
+          end
+        end
+      end
 
       -- 15. Primary Goal: Exit Door
       local target, targetPos, targetType = GetRoomTarget(room, roomNum)
