@@ -12529,13 +12529,10 @@ ResolveKeyAndUnlock = function(room, exitDoor, roomNum)
 
     -- Navigate directly to the key and pick it up
     if keyObj and keyPos then
-      KnobFarm.SetStatus("Going to Key...")
+      KnobFarm.SetStatus("Walking to Key...")
       DisableObstacleCollision(room)
       NavigateTo(keyPos, keyObj, "Key", 6.0, "Key", room, roomNum)
       task.wait(0.05)
-
-      -- Position character directly at key for 100% prompt proximity reach
-      root.CFrame = CFrame.new(keyPos + Vector3.new(0, 1.0, 0))
 
       for attempt = 1, 8 do
         if PlayerHasKeyOrLockpick() then break end
@@ -12597,7 +12594,7 @@ ResolveKeyAndUnlock = function(room, exitDoor, roomNum)
     end
     KnobFarm.OpenedDoors[exitDoor] = true
 
-    -- Step cleanly through doorway into next room
+    -- Walk cleanly through doorway into next room on foot (no void clipping!)
     pcall(function()
       for _, dp in ipairs(exitDoor:GetDescendants()) do
         if dp:IsA("BasePart") then dp.CanCollide = false end
@@ -12607,7 +12604,14 @@ ResolveKeyAndUnlock = function(room, exitDoor, roomNum)
     local diff = (doorCenter - approachPos)
     local flatDiff = Vector3.new(diff.X, 0, diff.Z)
     local stepDir = (flatDiff.Magnitude > 0.2 and flatDiff.Unit) or Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z).Unit
-    root.CFrame = root.CFrame + stepDir * 6.0
+    local throughPos = doorCenter + stepDir * 4.5
+
+    local stepStart = tick()
+    while tick() - stepStart < 0.7 and KnobFarm.Active and not _Unloading do
+      hum:MoveTo(throughPos)
+      if (root.Position - throughPos).Magnitude < 2.0 then break end
+      task.wait(0.04)
+    end
 
     KnobFarm.PassedFirstDoor = true
     KnobFarm.CurrentRoomNum = math.max(KnobFarm.CurrentRoomNum or 0, nextDoorNum)
@@ -13332,127 +13336,136 @@ NavigateTo = function(targetPos, targetInstance, label, maxWaitTime, targetType,
   local speed = (options and options.AutoFarmWalkSpeed and options.AutoFarmWalkSpeed.Value) or 22
   hum.WalkSpeed = speed
 
-  KnobFarm.SetStatus("Going to " .. (label or "target") .. "...")
+  KnobFarm.SetStatus("Walking to " .. (label or "target") .. "...")
 
+  -- Disable collisions ONLY on interior furniture/props so player doesn't get stuck on chairs/tables,
+  -- but KEEP outer room walls solid so player NEVER clips into the void (preventing Glitch)!
   if room then
     DisableObstacleCollision(room)
   end
 
-  -- Enable continuous noclip on Stepped so no physics frame restores collisions
-  local noclipConn = runService.Stepped:Connect(function()
-    if char and char.Parent then
-      for _, p in ipairs(char:GetDescendants()) do
-        if p:IsA("BasePart") then p.CanCollide = false end
-      end
-    end
-    if collisionPart then collisionPart.CanCollide = false end
-  end)
+  -- Clean up any residual velocity
+  local oldBv = root:FindFirstChild("AutoFarmVelocity")
+  if oldBv then oldBv:Destroy() end
 
-  -- Create BodyVelocity to guarantee unhindered motion through furniture, counters, doors
-  local bv = root:FindFirstChild("AutoFarmVelocity")
-  if not bv or not bv:IsA("BodyVelocity") then
-    if bv then bv:Destroy() end
-    bv = Instance.new("BodyVelocity")
-    bv.Name = "AutoFarmVelocity"
-    bv.MaxForce = Vector3.new(1e9, 0, 1e9)
-    bv.P = 1e6
-    bv.Parent = root
+  local reachThresh = (targetType == "Door" and 3.5) or (targetType == "Key" and 2.5) or 3.2
+  local maxWait = maxWaitTime or 8.0
+
+  -- 1. Use PathfindingService to generate safe waypoints that follow room corridors around corners
+  local waypoints = {}
+  local distTotal = (targetPos - root.Position).Magnitude
+
+  if distTotal > 5 then
+    pcall(function()
+      local path = pathfindingService:CreatePath({
+        AgentRadius = 1.6,
+        AgentHeight = 5.0,
+        AgentCanJump = false,
+        WaypointSpacing = 3.5,
+      })
+      path:ComputeAsync(root.Position, targetPos)
+      if path.Status == Enum.PathStatus.Success then
+        local rawWps = path:GetWaypoints()
+        if rawWps and #rawWps > 1 then
+          for i = 2, #rawWps do
+            table.insert(waypoints, rawWps[i].Position)
+          end
+        end
+      end
+    end)
   end
 
-  -- Show path nodes if toggle is on
+  if #waypoints == 0 then
+    table.insert(waypoints, targetPos)
+  else
+    waypoints[#waypoints] = targetPos
+  end
+
+  -- Render visual path nodes
   local showPath = options and options.ShowPath and options.ShowPath.Value
   if showPath then
-    local diff = (targetPos - root.Position)
-    local dist = math.sqrt(diff.X * diff.X + diff.Z * diff.Z)
-    local steps = math.max(1, math.min(15, math.floor(dist / 3.0)))
-    local wps = {}
-    for s = 1, steps do
-      local p = root.Position:Lerp(targetPos, s / steps)
-      table.insert(wps, { Position = p })
+    local nodeWps = {}
+    for _, wp in ipairs(waypoints) do
+      table.insert(nodeWps, { Position = wp })
     end
-    RenderPathNodes(wps)
+    RenderPathNodes(nodeWps)
   else
     ClearPathNodes()
   end
 
-  local floorPos = targetPos
-  local maxWait = maxWaitTime or 6.0
-  local reachThresh = (targetType == "Door" and 3.0) or (targetType == "Key" and 2.2) or 3.0
-  local startT = tick()
-  local lastPos = root.Position
-  local stuckTime = 0
+  local startTime = tick()
 
-  while (tick() - startT < maxWait) and KnobFarm.Active and not _Unloading do
-    if hum.Health <= 0 then break end
+  -- Walk through waypoints inside room
+  for idx, wpPos in ipairs(waypoints) do
+    if not KnobFarm.Active or _Unloading or hum.Health <= 0 then break end
+    if tick() - startTime >= maxWait then break end
 
-    -- Threat check
-    handleScreechAndEyes()
-    if HasRushAmbushBlitz and HasRushAmbushBlitz() then
-      handleThreatHiding()
-      break
-    end
+    local isLast = (idx == #waypoints)
+    local thresh = isLast and reachThresh or 4.0
+    local wpStart = tick()
+    local lastPos = root.Position
+    local stuckTimer = 0
 
-    local curPos = root.Position
-    local dx = floorPos.X - curPos.X
-    local dz = floorPos.Z - curPos.Z
-    local dist2D = math.sqrt(dx * dx + dz * dz)
+    while KnobFarm.Active and not _Unloading and hum.Health > 0 do
+      if tick() - startTime >= maxWait then break end
 
-    if dist2D <= reachThresh then
-      break
-    end
-
-    local moveDir = Vector3.new(dx / dist2D, 0, dz / dist2D)
-
-    -- Dynamic vertical assistance for stairs/slopes
-    local dy = floorPos.Y - curPos.Y
-    if math.abs(dy) > 2.0 then
-      bv.MaxForce = Vector3.new(1e9, 1e9, 1e9)
-      local vy = math.clamp(dy * 4.0, -18, 18)
-      bv.Velocity = Vector3.new(moveDir.X * speed, vy, moveDir.Z * speed)
-    else
-      bv.MaxForce = Vector3.new(1e9, 0, 1e9)
-      bv.Velocity = Vector3.new(moveDir.X * speed, 0, moveDir.Z * speed)
-    end
-
-    -- Camera & character look towards destination
-    pcall(function()
-      root.CFrame = CFrame.lookAt(curPos, curPos + moveDir)
-      local cam = workspace.CurrentCamera
-      if cam then
-        local camPos = cam.CFrame.Position
-        cam.CFrame = cam.CFrame:Lerp(CFrame.new(camPos, camPos + moveDir), 0.25)
+      -- Threats
+      handleScreechAndEyes()
+      if HasRushAmbushBlitz and HasRushAmbushBlitz() then
+        handleThreatHiding()
+        break
       end
-    end)
 
-    hum:Move(moveDir, false)
+      local curPos = root.Position
+      local dx = wpPos.X - curPos.X
+      local dz = wpPos.Z - curPos.Z
+      local dist2D = math.sqrt(dx * dx + dz * dz)
 
-    -- Anti-stuck: if barely moved in 0.35s, nudge CFrame forward
-    if (curPos - lastPos).Magnitude < 0.25 then
-      stuckTime = stuckTime + 0.04
-      if stuckTime > 0.35 then
-        root.CFrame = root.CFrame + moveDir * 2.0
-        stuckTime = 0
+      if dist2D <= thresh then
+        break
       end
-    else
-      stuckTime = 0
+
+      -- If stuck at this waypoint for > 3.0s, advance
+      if tick() - wpStart > 3.0 then
+        break
+      end
+
+      -- Face movement direction and point camera
+      pcall(function()
+        local moveDir = Vector3.new(dx / dist2D, 0, dz / dist2D)
+        root.CFrame = CFrame.lookAt(curPos, curPos + moveDir)
+        local cam = workspace.CurrentCamera
+        if cam then
+          local camPos = cam.CFrame.Position
+          cam.CFrame = cam.CFrame:Lerp(CFrame.new(camPos, camPos + moveDir), 0.2)
+        end
+      end)
+
+      -- Walk on foot!
+      hum:MoveTo(wpPos)
+
+      -- Anti-stuck: if stuck for 0.5s, jump and nudge
+      if (curPos - lastPos).Magnitude < 0.2 then
+        stuckTimer = stuckTimer + 0.04
+        if stuckTimer > 0.5 then
+          pcall(function() hum.Jump = true end)
+          local moveDir = Vector3.new(dx / dist2D, 0, dz / dist2D)
+          hum:Move(moveDir, false)
+          stuckTimer = 0
+        end
+      else
+        stuckTimer = 0
+      end
+      lastPos = curPos
+
+      task.wait(0.04)
     end
-    lastPos = curPos
-
-    task.wait(0.04)
   end
 
-  if bv and bv.Parent then
-    bv.Velocity = Vector3.zero
-    bv:Destroy()
-  end
-  if noclipConn then
-    noclipConn:Disconnect()
-  end
-  root.AssemblyLinearVelocity = Vector3.zero
-  hum:Move(Vector3.zero, false)
   ClearPathNodes()
+  hum:MoveTo(root.Position)
 
-  local finalDist = math.sqrt((root.Position.X - floorPos.X)^2 + (root.Position.Z - floorPos.Z)^2)
+  local finalDist = math.sqrt((root.Position.X - targetPos.X)^2 + (root.Position.Z - targetPos.Z)^2)
   return finalDist <= reachThresh + 2.0
 end
 
@@ -14046,7 +14059,13 @@ function KnobFarm.RunLoop()
           end
         end)
         local fwd = root.CFrame.LookVector
-        root.CFrame = root.CFrame + Vector3.new(fwd.X, 0, fwd.Z).Unit * 5.0
+        local throughPos = root.Position + Vector3.new(fwd.X, 0, fwd.Z).Unit * 4.5
+        local stepT = tick()
+        while tick() - stepT < 0.6 and KnobFarm.Active and not _Unloading do
+          hum:MoveTo(throughPos)
+          if (root.Position - throughPos).Magnitude < 2.0 then break end
+          task.wait(0.04)
+        end
       end
 
       KnobFarm.PassedFirstDoor = true
@@ -14104,8 +14123,8 @@ function KnobFarm.Start()
     if toggles and toggles.InstantInteract and not toggles.InstantInteract.Value then
       toggles.InstantInteract:SetValue(true)
     end
-    if toggles and toggles.Noclip and not toggles.Noclip.Value then
-      toggles.Noclip:SetValue(true)
+    if toggles and toggles.Noclip and toggles.Noclip.Value then
+      toggles.Noclip:SetValue(false)
     end
   end)
 
