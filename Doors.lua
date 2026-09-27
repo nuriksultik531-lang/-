@@ -11997,6 +11997,28 @@ if not val85.HotelNodesFolder then
   val85.HotelNodesFolder.Parent = workspace
 end
 
+local function safeFirePrompt(prompt)
+  if not prompt or not prompt:IsA("ProximityPrompt") then return end
+  pcall(function()
+    prompt.HoldDuration = 0
+    prompt.RequiresLineOfSight = false
+    prompt.MaxActivationDistance = 30
+    prompt.Enabled = true
+  end)
+  if fireproximityprompt then
+    pcall(fireproximityprompt, prompt, 0, true)
+    pcall(fireproximityprompt, prompt)
+  end
+  pcall(function()
+    prompt:InputHoldBegin()
+    task.wait(0.02)
+    prompt:InputHoldEnd()
+  end)
+  if Functions and Functions.ForceFirePrompt then
+    pcall(Functions.ForceFirePrompt, prompt)
+  end
+end
+
 function KnobFarm.SetStatus(txt)
   pcall(function()
     if Groupboxes and Groupboxes.AutoFarm_Status then
@@ -12155,10 +12177,17 @@ local function GetInstancePosition(inst)
         local prim = p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart", true)
         if prim then return prim.Position end
       end
+      if p:IsA("Tool") then
+        local handle = p:FindFirstChild("Handle") or p:FindFirstChildWhichIsA("BasePart", true)
+        if handle then return handle.Position end
+      end
     end
   elseif inst:IsA("Model") then
     local prim = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
     if prim then return prim.Position end
+  elseif inst:IsA("Tool") then
+    local handle = inst:FindFirstChild("Handle") or inst:FindFirstChildWhichIsA("BasePart", true)
+    if handle then return handle.Position end
   end
   local ok, pv = pcall(function() return inst:GetPivot().Position end)
   if ok and pv then return pv end
@@ -12385,13 +12414,13 @@ local function FindRoomKey(room)
   local function isKeyCandidate(inst)
     if not inst then return false end
     local n = inst.Name:lower()
-    if n == "door" or n == "lock" or n == "unlockprompt" or n:find("door", 1, true) then
+    if n == "door" or n == "lock" or n == "unlockprompt" or n:find("door", 1, true) or n:find("padlock", 1, true) then
       return false
     end
-    if inst:FindFirstAncestor("Door") or inst:FindFirstAncestor("Lock") then
+    if inst:FindFirstAncestor("Door") or inst:FindFirstAncestor("Lock") or inst:FindFirstAncestor("Padlock") then
       return false
     end
-    if n:find("fake", 1, true) then
+    if n:find("fake", 1, true) or n:find("skeleton", 1, true) then
       return false
     end
     return true
@@ -12400,30 +12429,35 @@ local function FindRoomKey(room)
   local function searchIn(container)
     if not container then return nil, nil end
 
-    -- 1. Direct search by model / part name
-    for _, keyName in ipairs({ "KeyObtain", "Key", "KeyElectrical", "ElectricalKeyObtain", "KeyIron", "IronKey" }) do
-      for _, inst in ipairs(container:GetDescendants()) do
-        if inst.Name == keyName and isKeyCandidate(inst) then
-          local pos = GetInstancePosition(inst)
-          if pos then return inst, pos end
-        end
+    -- 1. Fast direct lookup for standard DOORS key objects
+    for _, keyName in ipairs({ "KeyObtain", "ElectricalKeyObtain", "KeyElectrical", "KeyIron", "IronKey", "Key" }) do
+      local inst = container:FindFirstChild(keyName, true)
+      if inst and isKeyCandidate(inst) then
+        local pos = GetInstancePosition(inst)
+        if pos then return inst, pos end
       end
     end
 
-    -- 2. Search through ProximityPrompts
+    -- 2. Descendants scan for models/tools/parts with "key" in name
     for _, desc in ipairs(container:GetDescendants()) do
-      if desc:IsA("ProximityPrompt") and desc.Enabled and isKeyCandidate(desc) then
-        local p = desc.Parent
-        if p and isKeyCandidate(p) then
-          local pName = p.Name:lower()
-          local objText = (desc.ObjectText or ""):lower()
-          local dName = desc.Name:lower()
+      local dName = desc.Name:lower()
+      if (dName == "keyobtain" or dName == "key" or dName:find("keyobtain", 1, true)
+          or (dName:find("key", 1, true) and not dName:find("keyboard", 1, true))) and isKeyCandidate(desc) then
+        local pos = GetInstancePosition(desc)
+        if pos then return desc, pos end
+      end
 
-          if pName == "keyobtain" or pName == "key" or pName:find("key", 1, true)
-            or objText == "key" or objText:find("key", 1, true)
-            or dName:find("key", 1, true) then
-            local pos = GetInstancePosition(p) or GetInstancePosition(desc)
-            if pos then return p, pos end
+      -- 3. Search through ProximityPrompts (even if disabled or inside closed drawer!)
+      if desc:IsA("ProximityPrompt") and isKeyCandidate(desc) then
+        local p = desc.Parent
+        local pName = p and p.Name:lower() or ""
+        local objText = (desc.ObjectText or ""):lower()
+        local actText = (desc.ActionText or ""):lower()
+
+        if pName:find("key", 1, true) or objText:find("key", 1, true) or dName:find("key", 1, true) then
+          if isKeyCandidate(p) then
+            local pos = (p and GetInstancePosition(p)) or GetInstancePosition(desc)
+            if pos then return (p or desc), pos end
           end
         end
       end
@@ -12439,6 +12473,14 @@ local function FindRoomKey(room)
 
   local curRooms = workspace:FindFirstChild("CurrentRooms")
   if curRooms then
+    if KnobFarm and KnobFarm.CurrentRoomNum then
+      local r = curRooms:FindFirstChild(tostring(KnobFarm.CurrentRoomNum))
+      if r and r ~= room then
+        local kObj, kPos = searchIn(r)
+        if kObj and kPos then return kObj, kPos end
+      end
+    end
+
     for _, r in ipairs(curRooms:GetChildren()) do
       if r ~= room then
         local kObj, kPos = searchIn(r)
@@ -12452,21 +12494,37 @@ end
 
 local function IsDoorLocked(door)
   if not door or not door.Parent then return false, nil end
-  if KnobFarm.OpenedDoors[door] then return false, nil end
+  if KnobFarm.OpenedDoors and KnobFarm.OpenedDoors[door] then return false, nil end
   if door:GetAttribute("Opened") == true or door:GetAttribute("Open") == true then
     return false, nil
   end
+  if door:GetAttribute("Locked") == true then
+    local pr = door:FindFirstChildWhichIsA("ProximityPrompt", true)
+    return true, pr
+  end
 
-  local lock = door:FindFirstChild("Lock") or door:FindFirstChild("Lock", true)
+  local lock = door:FindFirstChild("Lock") or door:FindFirstChild("Padlock")
+    or door:FindFirstChild("Lock", true) or door:FindFirstChild("Padlock", true)
   if lock and lock.Parent then
     local unPr = lock:FindFirstChild("UnlockPrompt")
       or lock:FindFirstChildWhichIsA("ProximityPrompt", true)
+      or door:FindFirstChild("UnlockPrompt", true)
     return true, unPr
   end
 
   local unlockPrompt = door:FindFirstChild("UnlockPrompt", true)
-  if unlockPrompt and unlockPrompt.Enabled then
+  if unlockPrompt then
     return true, unlockPrompt
+  end
+
+  for _, pr in ipairs(door:GetDescendants()) do
+    if pr:IsA("ProximityPrompt") then
+      local act = (pr.ActionText or ""):lower()
+      local obj = (pr.ObjectText or ""):lower()
+      if act:find("unlock", 1, true) or obj:find("lock", 1, true) or pr.Name:lower():find("unlock", 1, true) then
+        return true, pr
+      end
+    end
   end
 
   return false, nil
@@ -12806,6 +12864,7 @@ end
 local NavigateTo
 local FollowPath
 local PassDoorStraight
+local ObtainKeyIfPresent
 
 local function LootAllInRoom(room)
   if not room or not KnobFarm.Active or _Unloading then return end
@@ -12836,15 +12895,17 @@ local function LootAllInRoom(room)
       elseif desc.Enabled and not KnobFarm.LootedObjects[desc] and IsLootablePrompt(desc) then
         local isGold = (p and (p.Name == "GoldPile" or p.Name == "TinyGold" or p.Name == "Gold" or p:GetAttribute("GoldValue")))
           or obj:find("gold", 1, true) or obj:find("stardust", 1, true)
+        local isKey = pName:find("key", 1, true) or obj:find("key", 1, true) or act:find("key", 1, true)
 
-        if lootDrawers or isGold then
+        if lootDrawers or isGold or isKey then
           local pos = GetInstancePosition(p) or GetInstancePosition(desc)
           if pos and HasFloorUnder(pos) then
             table.insert(cachedPrompts, {
               prompt = desc,
               pos = pos,
               parent = p,
-              isGold = isGold and true or false
+              isGold = isGold and true or false,
+              isKey = isKey and true or false
             })
           end
         end
@@ -12976,18 +13037,19 @@ local function LootAllInRoom(room)
       else
         local dist = (item.pos - cPos).Magnitude
 
-        -- Защита от бектрекинга: если предмет находится позади игрока далеко от выхода
+        -- Защита от бектрекинга: если предмет находится позади игрока далеко от выхода (ключи никогда не пропускаем!)
         local targetExitDist = exitPos and (item.pos - exitPos).Magnitude or nil
         local isBacktrack = false
-        if curPlayerExitDist and targetExitDist then
+        if not item.isKey and curPlayerExitDist and targetExitDist then
           if (targetExitDist > curPlayerExitDist + 22) and dist > 25 then
             isBacktrack = true
           end
         end
 
-        if not isBacktrack and dist <= 60 then
-          -- Приоритет золоту (скидка 15 стадов)
-          local score = dist + (item.isGold and -15 or 0)
+        if item.isKey or (not isBacktrack and dist <= 60) then
+          -- Приоритет: Ключ = -200 (абсолютный приоритет), Золото = -15
+          local priorityDiscount = item.isKey and -200 or (item.isGold and -15 or 0)
+          local score = dist + priorityDiscount
           if score < bestScore then
             bestScore = score
             bestTarget = item
@@ -13434,52 +13496,28 @@ PassDoorStraight = function(door, root, hum)
   if KnobFarm and KnobFarm.IgnoredDoors and KnobFarm.IgnoredDoors[door] then return end
   local isLocked, unPr = IsDoorLocked(door)
   if isLocked then
-    if not HasLockpick() and not HasKeyTool() then
+    if not HasKeyTool() then
       local room = door.Parent
-      local keyObj, keyPos = FindRoomKey(room)
-      if keyObj and keyPos then
-        KnobFarm.SetStatus("No lockpicks! Picking up key...")
-        NavigateTo(keyPos, keyObj, "Key", 6.0, "Key")
-        local kPrompt = keyObj:FindFirstChildWhichIsA("ProximityPrompt", true)
-        local pickStart = tick()
-        while not HasKeyTool() and tick() - pickStart < 2.0 and KnobFarm.Active and not _Unloading do
-          if kPrompt and kPrompt.Enabled then
-            pcall(function() Functions.ForceFirePrompt(kPrompt) end)
-            if fireproximityprompt then
-              pcall(fireproximityprompt, kPrompt, 0, true)
-              pcall(fireproximityprompt, kPrompt)
-            end
-          end
-          task.wait(0.05)
-        end
-      end
+      ObtainKeyIfPresent(room, KnobFarm.CurrentRoomNum)
     end
 
     local statusMsg = HasKeyTool() and "Unlocking door with key..." or "Unlocking door with lockpick..."
     KnobFarm.SetStatus(statusMsg)
     EquipUnlockTool()
     local unStart = tick()
-    while IsDoorLocked(door) and tick() - unStart < 3.0 and KnobFarm.Active and not _Unloading do
+    while IsDoorLocked(door) and tick() - unStart < 3.5 and KnobFarm.Active and not _Unloading do
       EquipUnlockTool()
       local _, curPrompt = IsDoorLocked(door)
-      if curPrompt and curPrompt.Enabled then
-        pcall(function()
-          curPrompt.HoldDuration = 0
-          curPrompt.RequiresLineOfSight = false
-          curPrompt.MaxActivationDistance = 30
-          curPrompt.Enabled = true
-        end)
-        if fireproximityprompt then
-          pcall(fireproximityprompt, curPrompt, 0, true)
-          pcall(fireproximityprompt, curPrompt)
-        end
-        pcall(function()
-          curPrompt:InputHoldBegin()
-          task.wait(0.04)
-          curPrompt:InputHoldEnd()
-        end)
+      if not curPrompt then
+        curPrompt = door:FindFirstChild("UnlockPrompt", true)
+          or (door:FindFirstChild("Lock", true) and door:FindFirstChild("Lock", true):FindFirstChildWhichIsA("ProximityPrompt", true))
+          or (door:FindFirstChild("Padlock", true) and door:FindFirstChild("Padlock", true):FindFirstChildWhichIsA("ProximityPrompt", true))
+          or door:FindFirstChildWhichIsA("ProximityPrompt", true)
       end
-      task.wait(0.06)
+      if curPrompt then
+        safeFirePrompt(curPrompt)
+      end
+      task.wait(0.05)
     end
   end
 
@@ -14152,6 +14190,103 @@ NavigateTo = function(targetPos, targetInstance, label, maxWaitTime, targetType)
     end
   end
   return true
+end
+
+local function ObtainKeyIfPresent(room, roomNum)
+  if not KnobFarm.Active or _Unloading then return false end
+  if HasKeyTool() then return true end
+
+  local keyObj, keyPos = FindRoomKey(room)
+  if not keyObj or not keyPos then
+    local waitStart = tick()
+    while not keyObj and (tick() - waitStart < 0.6) and KnobFarm.Active and not _Unloading do
+      task.wait(0.15)
+      keyObj, keyPos = FindRoomKey(room)
+    end
+  end
+
+  if not keyObj or not keyPos then return false end
+
+  KnobFarm.SetStatus("Key located! Walking to key (Room " .. tostring(roomNum or KnobFarm.CurrentRoomNum or "") .. ")...")
+
+  -- 1. Идем прямо к ключу
+  NavigateTo(keyPos, keyObj, "Key", 6.0, "Key")
+
+  -- 2. Если ключ внутри тумбочки/ящика, открываем ящик
+  local drawerAncestor = keyObj:FindFirstAncestorWhichIsA("Model") or keyObj.Parent
+  if drawerAncestor and drawerAncestor ~= room then
+    for _, dPr in ipairs(drawerAncestor:GetDescendants()) do
+      if dPr:IsA("ProximityPrompt") and dPr ~= keyObj and not dPr:IsDescendantOf(keyObj) then
+        local dAct = (dPr.ActionText or ""):lower()
+        local dObj = (dPr.ObjectText or ""):lower()
+        if dAct == "open" or dAct == "search" or dObj:find("drawer") or dObj:find("chest") or dObj:find("box") then
+          safeFirePrompt(dPr)
+          task.wait(0.02)
+        end
+      end
+    end
+  end
+
+  if room then
+    for _, desc in ipairs(room:GetDescendants()) do
+      if desc:IsA("ProximityPrompt") and desc ~= keyObj and not desc:IsDescendantOf(keyObj) then
+        local dAct = (desc.ActionText or ""):lower()
+        local dObj = (desc.ObjectText or ""):lower()
+        if dAct == "open" or dAct == "search" or dObj:find("drawer") or dObj:find("chest") or dObj:find("box") then
+          local pPos = GetInstancePosition(desc)
+          if pPos and (pPos - keyPos).Magnitude <= 7.0 then
+            safeFirePrompt(desc)
+          end
+        end
+      end
+    end
+  end
+
+  -- 3. Активируем промпт ключа и забираем
+  local pickStart = tick()
+  while not HasKeyTool() and (tick() - pickStart < 3.0) and KnobFarm.Active and not _Unloading do
+    local kPrompt = (keyObj:IsA("ProximityPrompt") and keyObj)
+      or keyObj:FindFirstChildWhichIsA("ProximityPrompt", true)
+
+    if not kPrompt and keyObj.Parent then
+      kPrompt = keyObj.Parent:FindFirstChildWhichIsA("ProximityPrompt", true)
+    end
+
+    if not kPrompt and room then
+      for _, desc in ipairs(room:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") then
+          local p = desc.Parent
+          local pName = p and p.Name:lower() or ""
+          local oText = (desc.ObjectText or ""):lower()
+          local dName = desc.Name:lower()
+          if (pName:find("key") or oText:find("key") or dName:find("key")) and not (pName:find("door") or pName:find("lock") or pName:find("padlock")) then
+            local pos = GetInstancePosition(p) or GetInstancePosition(desc)
+            if pos and (pos - keyPos).Magnitude <= 8 then
+              kPrompt = desc
+              break
+            end
+          end
+        end
+      end
+    end
+
+    if kPrompt then
+      safeFirePrompt(kPrompt)
+    end
+
+    EquipUnlockTool()
+    task.wait(0.05)
+  end
+
+  EquipUnlockTool()
+  KnobFarm.LootedObjects[keyObj] = true
+
+  if HasKeyTool() then
+    KnobFarm.SetStatus("Key collected! Heading to exit door...")
+    return true
+  end
+
+  return false
 end
 
 -- ═══════════════════════════════════════════════════════════════════
@@ -15079,13 +15214,7 @@ function KnobFarm.RunLoop()
         continue
       end
 
-      -- 9. Loot EVERYTHING in room (Gold, Stardust, Drawers, Chests, Items)
-      -- В 49 комнате не тратим время на лутание — бежим сразу к 50 двери
-      if (roomNum or 0) > 0 and roomNum ~= 49 and KnobFarm.PassedFirstDoor and not isGateRoom then
-        LootAllInRoom(room)
-      end
-
-      -- 10. Primary Goal: Exit Door (or Key if locked and no lockpicks)
+      -- 9. Check Exit Door & Key Status FIRST
       local target, targetPos, targetType = GetRoomTarget(room)
       if not target or not targetPos then
         KnobFarm.SetStatus("Searching Door (Room " .. tostring(roomNum) .. ")...")
@@ -15093,41 +15222,34 @@ function KnobFarm.RunLoop()
         continue
       end
 
-      -- Если дверь заперта, а отмычек нет — идем к ключу по перпендикулярным линиям
       local isLocked = IsDoorLocked(target)
-      if isLocked and not HasLockpick() and not HasKeyTool() then
-        local keyObj, keyPos = FindRoomKey(room)
-        if not keyObj then
-          local waitKeyStart = tick()
-          while not keyObj and tick() - waitKeyStart < 1.0 and KnobFarm.Active and not _Unloading do
-            task.wait(0.2)
-            keyObj, keyPos = FindRoomKey(room)
-          end
-        end
+      local roomKeyObj, roomKeyPos = nil, nil
+      if not HasKeyTool() then
+        roomKeyObj, roomKeyPos = FindRoomKey(room)
+      end
 
-        if keyObj and keyPos then
-          KnobFarm.SetStatus("No lockpicks! Walking to key (Room " .. tostring(roomNum) .. ")...")
-          NavigateTo(keyPos, keyObj, "Key", 6.0, "Key")
+      local isKeyRoom = (roomKeyObj ~= nil) or isLocked
 
-          local kPrompt = keyObj:FindFirstChildWhichIsA("ProximityPrompt", true)
-          local pickStart = tick()
-          while not HasKeyTool() and tick() - pickStart < 2.0 and KnobFarm.Active and not _Unloading do
-            if kPrompt and kPrompt.Enabled then
-              pcall(function() Functions.ForceFirePrompt(kPrompt) end)
-              if fireproximityprompt then
-                pcall(fireproximityprompt, kPrompt, 0, true)
-                pcall(fireproximityprompt, kPrompt)
-              end
-            end
-            task.wait(0.05)
-          end
-
+      -- Если в комнате есть ключ или дверь заперта — СРАЗУ идем за ключом!
+      if isKeyRoom and not HasKeyTool() then
+        KnobFarm.SetStatus("Key needed! Walking to key (Room " .. tostring(roomNum) .. ")...")
+        local gotKey = ObtainKeyIfPresent(room, roomNum)
+        if gotKey then
           EquipUnlockTool()
-        else
-          KnobFarm.SetStatus("Door locked & no key found in Room " .. tostring(roomNum))
+          KnobFarm.SetStatus("Key collected! Opening exit door...")
         end
       end
 
+      -- Если комната обычная (не заперта) — лутаем золото и тумбочки
+      -- В запертой комнате: если включен лут тумбочек, собираем после взятия ключа
+      if (roomNum or 0) > 0 and roomNum ~= 49 and KnobFarm.PassedFirstDoor and not isGateRoom then
+        if not isKeyRoom or (toggles and toggles.AutoFarmLootDrawers and toggles.AutoFarmLootDrawers.Value) then
+          LootAllInRoom(room)
+        end
+      end
+
+      -- 10. Primary Goal: Exit Door
+      EquipUnlockTool()
       KnobFarm.SetStatus("Running to Door (Room " .. tostring(roomNum) .. ")")
 
       -- 1. Сначала проверяем официальные PathfindNodes комнаты (центр коридоров от разработчиков DOORS)
