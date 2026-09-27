@@ -11829,6 +11829,8 @@ KnobFarm = KnobFarm or {}
 KnobFarm.Active = false
 KnobFarm.Thread = nil
 KnobFarm.CurrentRoomNum = 0
+KnobFarm.HighestRoom = 0
+KnobFarm.CompletedRooms = {}
 KnobFarm.DisableGodmodeForBoss = false
 KnobFarm.PassedFirstDoor = false
 KnobFarm.LootedObjects = setmetatable({}, { __mode = "k" })
@@ -11852,7 +11854,7 @@ local GetPlayerCurrentRoom, HasRoomGate, HasDoorLattice, DisableObstacleCollisio
 local HasLineOfSight, PhaseTemporary, TeleportLootRoom, LootDrawersInRoom, HasRushAmbushBlitz
 local handleScreechAndEyes, handleThreatHiding, isSeekUpcoming, HasSeekEyes, isSeekThreatZone
 local WaitForThreats, IsStuck, GetRoomTarget, FollowPath, NavigateTo, handleRoom50, handleRoom100
-local ExecuteAutoDoorSkip, GetFloorPosition, GetInstancePosition, SetCrouched, TriggerPrompt
+local ExecuteAutoDoorSkip, GetFloorPosition, GetInstancePosition, SetCrouched, TriggerPrompt, WalkThroughDoor
 
 local function GetPlayerKnobs()
   local val = nil
@@ -12021,6 +12023,8 @@ end
 local function ResetFarmState()
   ClearPathNodes()
   KnobFarm.PassedFirstDoor = false
+  KnobFarm.CompletedRooms = {}
+  KnobFarm.HighestRoom = 0
   KnobFarm.LootedObjects = setmetatable({}, { __mode = "k" })
   KnobFarm.OpenedDoors = setmetatable({}, { __mode = "k" })
   KnobFarm.StartKnobs = nil
@@ -12480,6 +12484,94 @@ FindRoomKey = function(room)
   return nil, nil, nil
 end
 
+-- Walks decisively through the doorway into the next room, ensuring the bot firmly enters room N+1
+WalkThroughDoor = function(door, nextRoomNum, approachPos)
+  if not door then return end
+  local char = localPlayer2 and localPlayer2.Character
+  local root = char and char:FindFirstChild("HumanoidRootPart")
+  local hum = char and char:FindFirstChildOfClass("Humanoid")
+  if not root or not hum or hum.Health <= 0 then return end
+
+  -- 1. Open the door if prompt or remote exists
+  if door:FindFirstChild("ClientOpen") then
+    pcall(function() door.ClientOpen:FireServer() end)
+  end
+  local dPr = door:FindFirstChildWhichIsA("ProximityPrompt", true)
+  if dPr and dPr.Enabled then
+    TriggerPrompt(dPr)
+  end
+  KnobFarm.OpenedDoors[door] = true
+
+  -- 2. Turn off collisions on door parts and doorframe so walk is completely unhindered
+  pcall(function()
+    for _, dp in ipairs(door:GetDescendants()) do
+      if dp:IsA("BasePart") then dp.CanCollide = false end
+    end
+  end)
+
+  local doorCenter = GetDoorCenter(door) or root.Position
+  local curRooms = workspace:FindFirstChild("CurrentRooms")
+  local nextRoom = curRooms and curRooms:FindFirstChild(tostring(nextRoomNum))
+  if nextRoom then
+    DisableObstacleCollision(nextRoom)
+  end
+
+  -- 3. Calculate direction through the doorway into the next room
+  local throughDir = nil
+  if nextRoom then
+    local ok, cf = pcall(function() return nextRoom:GetBoundingBox() end)
+    if ok and cf then
+      local toNext = (cf.Position - doorCenter)
+      local flat = Vector3.new(toNext.X, 0, toNext.Z)
+      if flat.Magnitude > 2.0 then
+        throughDir = flat.Unit
+      end
+    end
+  end
+
+  if not throughDir and approachPos then
+    local toDoor = (doorCenter - approachPos)
+    local flat = Vector3.new(toDoor.X, 0, toDoor.Z)
+    if flat.Magnitude > 0.5 then
+      throughDir = flat.Unit
+    end
+  end
+
+  if not throughDir then
+    local flatFwd = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
+    throughDir = (flatFwd.Magnitude > 0.1 and flatFwd.Unit) or Vector3.new(0, 0, -1)
+  end
+
+  local throughPos = doorCenter + throughDir * 12.0
+  KnobFarm.SetStatus("Entering Room " .. tostring(nextRoomNum) .. "...")
+
+  local speed = (options and options.AutoFarmWalkSpeed and options.AutoFarmWalkSpeed.Value) or 22
+  hum.WalkSpeed = speed
+
+  local tStart = tick()
+  while (tick() - tStart < 1.8) and KnobFarm.Active and not _Unloading do
+    if hum.Health <= 0 then break end
+    local curPos = root.Position
+    local diff = (throughPos - curPos)
+    local dist2D = math.sqrt(diff.X * diff.X + diff.Z * diff.Z)
+    if dist2D <= 2.5 then break end
+
+    hum:MoveTo(throughPos)
+    pcall(function()
+      root.CFrame = CFrame.lookAt(curPos, curPos + Vector3.new(diff.X, 0, diff.Z))
+    end)
+    task.wait(0.04)
+  end
+
+  hum:Move(Vector3.zero, false)
+  KnobFarm.PassedFirstDoor = true
+  KnobFarm.CurrentRoomNum = nextRoomNum
+  KnobFarm.HighestRoom = math.max(KnobFarm.HighestRoom or 0, nextRoomNum)
+  if nextRoomNum and nextRoomNum > 0 then
+    KnobFarm.CompletedRooms[nextRoomNum - 1] = true
+  end
+end
+
 -- Resolves finding the key, walking to it, taking it, equipping it, and unlocking the door
 ResolveKeyAndUnlock = function(room, exitDoor, roomNum)
   if not exitDoor then return true end
@@ -12584,37 +12676,8 @@ ResolveKeyAndUnlock = function(room, exitDoor, roomNum)
       task.wait(0.06)
     end
 
-    -- Open the door!
-    if exitDoor:FindFirstChild("ClientOpen") then
-      pcall(function() exitDoor.ClientOpen:FireServer() end)
-    end
-    local dPr = exitDoor:FindFirstChildWhichIsA("ProximityPrompt", true)
-    if dPr and dPr.Enabled then
-      TriggerPrompt(dPr)
-    end
-    KnobFarm.OpenedDoors[exitDoor] = true
-
-    -- Walk cleanly through doorway into next room on foot (no void clipping!)
-    pcall(function()
-      for _, dp in ipairs(exitDoor:GetDescendants()) do
-        if dp:IsA("BasePart") then dp.CanCollide = false end
-      end
-    end)
-
-    local diff = (doorCenter - approachPos)
-    local flatDiff = Vector3.new(diff.X, 0, diff.Z)
-    local stepDir = (flatDiff.Magnitude > 0.2 and flatDiff.Unit) or Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z).Unit
-    local throughPos = doorCenter + stepDir * 4.5
-
-    local stepStart = tick()
-    while tick() - stepStart < 0.7 and KnobFarm.Active and not _Unloading do
-      hum:MoveTo(throughPos)
-      if (root.Position - throughPos).Magnitude < 2.0 then break end
-      task.wait(0.04)
-    end
-
-    KnobFarm.PassedFirstDoor = true
-    KnobFarm.CurrentRoomNum = math.max(KnobFarm.CurrentRoomNum or 0, nextDoorNum)
+    -- Open door and step decisively 12 studs through into the next room!
+    WalkThroughDoor(exitDoor, nextDoorNum, approachPos)
     return true
   else
     KnobFarm.SetStatus("Key not found in Room " .. tostring(roomNum) .. ", retrying...")
@@ -12719,16 +12782,36 @@ GetPlayerCurrentRoom = function()
   local attrRoom = localPlayer2 and localPlayer2:GetAttribute("CurrentRoom")
   if attrRoom and typeof(attrRoom) == "number" then
     local r = roomsFolder:FindFirstChild(tostring(attrRoom))
-    if r then return r, attrRoom end
+    if r and not (KnobFarm.CompletedRooms and KnobFarm.CompletedRooms[attrRoom]) then
+      return r, attrRoom
+    end
   end
 
-  -- 2. Physical room detection by bounding box / containment
+  -- 2. Physical raycast downward onto room floor
+  local rayParams = RaycastParams.new()
+  rayParams.FilterType = Enum.RaycastFilterType.Exclude
+  rayParams.FilterDescendantsInstances = { char, val85 and val85.HotelNodesFolder }
+  local hit = workspace:Raycast(root.Position + Vector3.new(0, 2, 0), Vector3.new(0, -35, 0), rayParams)
+  if hit and hit.Instance then
+    local p = hit.Instance
+    while p and p.Parent and p.Parent ~= roomsFolder do
+      p = p.Parent
+    end
+    if p and p.Parent == roomsFolder and tonumber(p.Name) then
+      local n = tonumber(p.Name)
+      if not (KnobFarm.CompletedRooms and KnobFarm.CompletedRooms[n]) then
+        return p, n
+      end
+    end
+  end
+
+  -- 3. Physical room detection by bounding box / containment
   local candidateRoom = nil
   local candidateNum = nil
 
   for _, r in ipairs(roomsFolder:GetChildren()) do
     local n = tonumber(r.Name)
-    if n then
+    if n and not (KnobFarm.CompletedRooms and KnobFarm.CompletedRooms[n]) then
       local ok, cf, sz = pcall(function() return r:GetBoundingBox() end)
       if ok and cf and sz then
         local localP = cf:PointToObjectSpace(root.Position)
@@ -12749,35 +12832,17 @@ GetPlayerCurrentRoom = function()
     return candidateRoom, candidateNum
   end
 
-  -- 3. Physical raycast downward onto room floor
-  local rayParams = RaycastParams.new()
-  rayParams.FilterType = Enum.RaycastFilterType.Exclude
-  rayParams.FilterDescendantsInstances = { char, val85 and val85.HotelNodesFolder }
-  local hit = workspace:Raycast(root.Position + Vector3.new(0, 2, 0), Vector3.new(0, -35, 0), rayParams)
-  if hit and hit.Instance then
-    local p = hit.Instance
-    while p and p.Parent and p.Parent ~= roomsFolder do
-      p = p.Parent
-    end
-    if p and p.Parent == roomsFolder and tonumber(p.Name) then
-      local n = tonumber(p.Name)
-      return p, n
-    end
+  -- 4. Highest room reached
+  local hr = KnobFarm.HighestRoom or 0
+  local hrRoom = roomsFolder:FindFirstChild(tostring(hr))
+  if hrRoom and not (KnobFarm.CompletedRooms and KnobFarm.CompletedRooms[hr]) then
+    return hrRoom, hr
   end
 
-  -- 4. ReplicatedStorage GameData.LatestRoom check
-  local gameData = replicatedStorage and replicatedStorage:FindFirstChild("GameData")
-  local latestRoom = gameData and gameData:FindFirstChild("LatestRoom")
-  if latestRoom and typeof(latestRoom.Value) == "number" then
-    local lrNum = latestRoom.Value
-    local r = roomsFolder:FindFirstChild(tostring(lrNum))
-    if r then return r, lrNum end
-  end
-
-  -- 5. Fallback: Current active room state
-  if KnobFarm.CurrentRoomNum then
-    local r = roomsFolder:FindFirstChild(tostring(KnobFarm.CurrentRoomNum))
-    if r then return r, KnobFarm.CurrentRoomNum end
+  -- 5. Next highest room
+  local nextRoom = roomsFolder:FindFirstChild(tostring(hr + 1))
+  if nextRoom then
+    return nextRoom, hr + 1
   end
 
   local defaultRoom = roomsFolder:FindFirstChild("0") or roomsFolder:FindFirstChild("1")
@@ -13979,8 +14044,6 @@ function KnobFarm.RunLoop()
       if exitDoor and IsDoorLocked(exitDoor, room) then
         local unlocked = ResolveKeyAndUnlock(room, exitDoor, roomNum)
         if unlocked then
-          KnobFarm.PassedFirstDoor = true
-          KnobFarm.CurrentRoomNum = math.max(KnobFarm.CurrentRoomNum or 0, (roomNum or 0) + 1)
           task.wait(0.15)
           continue
         else
@@ -13992,19 +14055,22 @@ function KnobFarm.RunLoop()
       -- 14. Nightstands / Bedside tables ("тумбочки")
       -- User explicitly requested:
       -- "в след комнате если есть тумбочка лутать его и дити к след если тумбочки нет сразу к след комнате"
-      local drawers = LootDrawersInRoom(room)
-      if drawers and #drawers > 0 then
-        for _, drawer in ipairs(drawers) do
-          if not KnobFarm.Active or _Unloading then break end
-          handleScreechAndEyes()
-          if HasRushAmbushBlitz() then handleThreatHiding() end
+      local lootNightstands = not toggles.AutoFarmLootDrawers or toggles.AutoFarmLootDrawers.Value
+      if lootNightstands then
+        local drawers = LootDrawersInRoom(room)
+        if drawers and #drawers > 0 then
+          for _, drawer in ipairs(drawers) do
+            if not KnobFarm.Active or _Unloading then break end
+            handleScreechAndEyes()
+            if HasRushAmbushBlitz() then handleThreatHiding() end
 
-          if drawer.prompt and drawer.prompt.Enabled and not KnobFarm.LootedObjects[drawer.parent] then
-            NavigateTo(drawer.pos, drawer.parent, "Nightstand", 4.0, "Drawer", room, roomNum)
-            TriggerPrompt(drawer.prompt)
-            KnobFarm.LootedObjects[drawer.parent] = true
-            task.wait(0.06)
-            TeleportLootRoom(room, false)
+            if drawer.prompt and drawer.prompt.Enabled and not KnobFarm.LootedObjects[drawer.parent] then
+              NavigateTo(drawer.pos, drawer.parent, "Nightstand", 4.0, "Drawer", room, roomNum)
+              TriggerPrompt(drawer.prompt)
+              KnobFarm.LootedObjects[drawer.parent] = true
+              task.wait(0.06)
+              TeleportLootRoom(room, false)
+            end
           end
         end
       end
@@ -14029,8 +14095,6 @@ function KnobFarm.RunLoop()
       if target and IsDoorLocked(target, room) then
         local unlocked = ResolveKeyAndUnlock(room, target, roomNum)
         if unlocked then
-          KnobFarm.PassedFirstDoor = true
-          KnobFarm.CurrentRoomNum = math.max(KnobFarm.CurrentRoomNum or 0, (roomNum or 0) + 1)
           task.wait(0.15)
           continue
         else
@@ -14042,33 +14106,8 @@ function KnobFarm.RunLoop()
       -- Walk straight to Door
       local navOk = NavigateTo(targetPos, target, "Door " .. tostring(roomNum + 1), 6.0, "Door", room, roomNum)
 
-      -- Open door prompt if needed and step through
-      if target then
-        if target:FindFirstChild("ClientOpen") then
-          pcall(function() target.ClientOpen:FireServer() end)
-        end
-        local dPr = target:FindFirstChildWhichIsA("ProximityPrompt", true)
-        if dPr and dPr.Enabled then
-          TriggerPrompt(dPr)
-        end
-        KnobFarm.OpenedDoors[target] = true
-
-        pcall(function()
-          for _, dp in ipairs(target:GetDescendants()) do
-            if dp:IsA("BasePart") then dp.CanCollide = false end
-          end
-        end)
-        local fwd = root.CFrame.LookVector
-        local throughPos = root.Position + Vector3.new(fwd.X, 0, fwd.Z).Unit * 4.5
-        local stepT = tick()
-        while tick() - stepT < 0.6 and KnobFarm.Active and not _Unloading do
-          hum:MoveTo(throughPos)
-          if (root.Position - throughPos).Magnitude < 2.0 then break end
-          task.wait(0.04)
-        end
-      end
-
-      KnobFarm.PassedFirstDoor = true
+      -- Open door and step decisively 12 studs through into the next room!
+      WalkThroughDoor(target, roomNum + 1, targetPos)
       task.wait(0.1)
     end
   end)
@@ -14090,12 +14129,19 @@ function KnobFarm.Start()
   KnobFarm.PassedFirstDoor = false
   KnobFarm.LootedObjects = setmetatable({}, { __mode = "k" })
   KnobFarm.OpenedDoors = setmetatable({}, { __mode = "k" })
+  KnobFarm.CompletedRooms = {}
   KnobFarm.DisableGodmodeForBoss = false
   KnobFarm.LastPosition = nil
   KnobFarm.LastMoveTime = tick()
 
   local _, curRoomNum = GetPlayerCurrentRoom()
   KnobFarm.CurrentRoomNum = curRoomNum or 0
+  KnobFarm.HighestRoom = curRoomNum or 0
+  if (curRoomNum or 0) > 0 then
+    for i = 0, (curRoomNum - 1) do
+      KnobFarm.CompletedRooms[i] = true
+    end
+  end
   KnobFarm.LastRoomNum = curRoomNum
   KnobFarm.RoomEntryTime = tick()
   if (curRoomNum or 0) >= 1 then
