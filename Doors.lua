@@ -2224,9 +2224,9 @@ Groupboxes.AutoFarm_Settings:AddSlider("AutoFarmWalkSpeed", {
 })
 
 Groupboxes.AutoFarm_Settings:AddToggle("AutoFarmLootDrawers", {
-  Text = "Loot Drawers & Tables",
+  Text = "Loot Nightstands & Coins",
   Default = true,
-  Tooltip = "Visits nearby drawers, chests, and tables to collect gold",
+  Tooltip = "Visits bedside tables and drawers to collect coins (ignores tools and chests)",
 })
 
 Groupboxes.AutoFarm_Settings:AddToggle("AutoFarmRunTo100", {
@@ -12032,6 +12032,9 @@ local function ResetFarmState()
     if toggles.Phase and toggles.Phase.Value then
       toggles.Phase:SetValue(false)
     end
+    if toggles.Noclip and toggles.Noclip.Value then
+      toggles.Noclip:SetValue(false)
+    end
     Phase.TargetPosition = nil
     Phase.Speed = nil
   end)
@@ -12956,7 +12959,26 @@ LootDrawersInRoom = function(room)
       local parent = desc.Parent
       if parent then
         local pName = parent.Name
-        if (pName == "ChestBox" or pName == "ChestBoxLocked" or pName == "Toolbox" or pName == "Toolbox_Locked" or pName == "Toolshed_Small" or pName:find("Drawer", 1, true) or (pName:find("Chest", 1, true) and pName:lower():find("locked", 1, true))) then
+        local pLower = pName:lower()
+
+        -- Filter: ONLY bedside tables, nightstands, and drawers for coins
+        -- Strictly exclude toolboxes, chests, lockers, safes, toolsheds
+        local isNightstand = (pName:find("Drawer", 1, true)
+          or pLower:find("nightstand", 1, true)
+          or pLower:find("sidetable", 1, true)
+          or pLower:find("dresser", 1, true)
+          or pLower:find("desk", 1, true)
+          or (pName:find("Table", 1, true) and not pLower:find("locked", 1, true)))
+
+        local isExcluded = pLower:find("chest", 1, true)
+          or pLower:find("tool", 1, true)
+          or pLower:find("locker", 1, true)
+          or pLower:find("safe", 1, true)
+          or pLower:find("shed", 1, true)
+          or pLower:find("locked", 1, true)
+          or pLower:find("box", 1, true)
+
+        if isNightstand and not isExcluded then
           local pos = GetInstancePosition(parent)
           if pos then
             table.insert(targets, { prompt = desc, pos = pos, parent = parent })
@@ -13264,7 +13286,40 @@ GetRoomTarget = function(room, roomNum)
     or room:FindFirstChild("Door")
     or room:FindFirstChild("Door", true)
 
-  if not exitDoor then return nil, nil, nil end
+  if not exitDoor then
+    -- Check for Seek introduction hallway triggers / hallway progression
+    local seekTrigger = room:FindFirstChild("TriggerEventCollision", true)
+      or room:FindFirstChild("SeekTrigger", true)
+      or room:FindFirstChild("ChaseStartTrigger", true)
+      or room:FindFirstChild("Seek_Arm", true)
+      or room:FindFirstChild("Seeking", true)
+
+    if seekTrigger then
+      local trigPos = GetInstancePosition(seekTrigger)
+      if trigPos then
+        return seekTrigger, trigPos, "SeekTrigger"
+      end
+    end
+
+    -- If no door and in Seek zone (Room 30-45 or 80-95), walk forward towards far end of the room
+    local n = roomNum or KnobFarm.CurrentRoomNum or 0
+    if (n >= 30 and n <= 45) or (n >= 80 and n <= 95) then
+      local ok, roomCF, roomSize = pcall(function() return room:GetBoundingBox() end)
+      if ok and roomCF and roomSize then
+        local char = localPlayer2 and localPlayer2.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local p1 = (roomCF * CFrame.new(0, 0, -roomSize.Z / 2 + 5)).Position
+        local p2 = (roomCF * CFrame.new(0, 0, roomSize.Z / 2 - 5)).Position
+        local farPos = p1
+        if root and (p2 - root.Position).Magnitude > (p1 - root.Position).Magnitude then
+          farPos = p2
+        end
+        return room, GetFloorPosition(farPos) or farPos, "SeekTrigger"
+      end
+    end
+
+    return nil, nil, nil
+  end
 
   -- Primary Goal: True Exit Door
   local doorCenter = GetDoorCenter(exitDoor)
@@ -13335,7 +13390,8 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
           local segZ = nextPos.Z - curPos.Z
           local pastX = rootPos.X - curPos.X
           local pastZ = rootPos.Z - curPos.Z
-          if (pastX * segX + pastZ * segZ) > 0 and HasLineOfSight(rootPos, nextPos) then
+          local isNoclipping = (toggles and toggles.Noclip and toggles.Noclip.Value) or (toggles and toggles.Phase and toggles.Phase.Value)
+          if (pastX * segX + pastZ * segZ) > 0 and (isNoclipping or HasLineOfSight(rootPos, nextPos)) then
             if currentNodes[wpIndex] and currentNodes[wpIndex].Parent then
               pcall(function() currentNodes[wpIndex]:Destroy() end)
               currentNodes[wpIndex] = nil
@@ -13665,6 +13721,22 @@ NavigateTo = function(targetPos, targetInstance, label, maxWaitTime, targetType,
   local reachThresh = (targetType == "Door" and 3.5) or (targetType == "Key" and 3.5) or 4.5
   if currentDist <= reachThresh then
     return true
+  end
+
+  -- Direct transit through walls with Noclip (fast, never gets stuck on furniture, beds, or doorframes)
+  local isNoclipping = (toggles.Noclip and toggles.Noclip.Value) or (toggles.Phase and toggles.Phase.Value)
+  if isNoclipping then
+    local diff = (floorPos - root.Position)
+    local flatDist = Vector2.new(diff.X, diff.Z).Magnitude
+    local directWps = {}
+    local stepSize = 3.0
+    local steps = math.max(1, math.ceil(flatDist / stepSize))
+    for s = 0, steps do
+      local p = root.Position:Lerp(floorPos, s / steps)
+      local fl = GetFloorPosition(p) or p
+      table.insert(directWps, PathWaypoint.new(fl, Enum.PathWaypointAction.Walk))
+    end
+    return FollowPath(directWps, targetInstance, floorPos, targetType or label or "Target", room, roomNum or KnobFarm.CurrentRoomNum)
   end
 
   -- Helper to attempt path computation
@@ -14298,10 +14370,7 @@ function KnobFarm.RunLoop()
             if HasRushAmbushBlitz() then handleThreatHiding() end
 
             if drawer.prompt and drawer.prompt.Enabled and not KnobFarm.LootedObjects[drawer.parent] then
-              NavigateTo(drawer.pos, drawer.parent, drawer.parent.Name, 4.0, "Drawer")
-              if drawer.parent.Name:lower():find("locked", 1, true) then
-                EquipUnlockTool()
-              end
+              NavigateTo(drawer.pos, drawer.parent, "Nightstand", 4.0, "Drawer", room, roomNum)
               TriggerPrompt(drawer.prompt)
               KnobFarm.LootedObjects[drawer.parent] = true
               task.wait(0.06)
@@ -14311,11 +14380,19 @@ function KnobFarm.RunLoop()
         end
       end
 
-      -- 15. Primary Goal: Exit Door
+      -- 15. Primary Goal: Exit Door or Seek Trigger
       local target, targetPos, targetType = GetRoomTarget(room, roomNum)
       if not target or not targetPos then
         KnobFarm.SetStatus("Searching path (Room " .. tostring(roomNum) .. ")...")
         task.wait(0.3)
+        continue
+      end
+
+      -- Seek introduction hallway: automatically advance to start the Seek cutscene
+      if targetType == "SeekTrigger" then
+        KnobFarm.SetStatus("Advancing into Seek Hallway (Room " .. tostring(roomNum) .. ")...")
+        NavigateTo(targetPos, target, "Seek Trigger", 6.0, "SeekTrigger", room, roomNum)
+        task.wait(0.2)
         continue
       end
 
@@ -14397,6 +14474,9 @@ function KnobFarm.Start()
     if toggles and toggles.InstantInteract and not toggles.InstantInteract.Value then
       toggles.InstantInteract:SetValue(true)
     end
+    if toggles and toggles.Noclip and not toggles.Noclip.Value then
+      toggles.Noclip:SetValue(true)
+    end
   end)
 
   KnobFarm.Thread = task.spawn(KnobFarm.RunLoop)
@@ -14421,6 +14501,9 @@ function KnobFarm.Stop()
     if options and options.Walkspeed and KnobFarm.PreviousWalkSpeed then
       options.Walkspeed:SetValue(KnobFarm.PreviousWalkSpeed)
       KnobFarm.PreviousWalkSpeed = nil
+    end
+    if toggles and toggles.Noclip and toggles.Noclip.Value then
+      toggles.Noclip:SetValue(false)
     end
   end)
 
