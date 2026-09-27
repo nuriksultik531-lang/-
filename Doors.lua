@@ -12306,13 +12306,10 @@ end
 
 IsDoorLocked = function(door, room)
   if not door or not door.Parent then
-    if room then
-      local lockInRoom = room:FindFirstChild("Lock", true) or room:FindFirstChild("Padlock", true)
-      if lockInRoom and lockInRoom.Parent then
-        local unPr = lockInRoom:FindFirstChildWhichIsA("ProximityPrompt", true)
-        return true, unPr, lockInRoom
-      end
-    end
+    return false, nil, nil
+  end
+
+  if KnobFarm.OpenedDoors[door] then
     return false, nil, nil
   end
 
@@ -12321,10 +12318,6 @@ IsDoorLocked = function(door, room)
   end
 
   local lock = door:FindFirstChild("Lock", true) or door:FindFirstChild("Padlock", true)
-  if not lock and room then
-    lock = room:FindFirstChild("Lock", true) or room:FindFirstChild("Padlock", true)
-  end
-
   if lock and lock.Parent then
     local unPr = lock:FindFirstChild("UnlockPrompt")
       or lock:FindFirstChildWhichIsA("ProximityPrompt", true)
@@ -12375,85 +12368,113 @@ IsDoorOpen = function(door)
   return false
 end
 
--- Searches room for any key (KeyObtain, Key, KeyIron, KeyElectrical)
+-- Searches room, Room 0, workspace.Drops, and CurrentRooms for any key
 FindRoomKey = function(room)
-  if not room then return nil, nil, nil end
+  local char = localPlayer2 and localPlayer2.Character
+  local root = char and char:FindFirstChild("HumanoidRootPart")
+  local rootPos = root and root.Position
 
-  -- Pass 1: Objects named KeyObtain, Key, KeyIron, KeyElectrical, ElectricalKeyObtain in room
-  for _, desc in ipairs(room:GetDescendants()) do
-    local n = desc.Name
-    if (n == "KeyObtain" or n == "KeyIron" or n == "IronKey" or n == "KeyElectrical" or n == "ElectricalKeyObtain" or n == "Key")
-      and not desc:FindFirstAncestorWhichIsA("Tool") and not desc:FindFirstAncestor("Door") then
-      local pr = desc:FindFirstChildWhichIsA("ProximityPrompt", true) or (desc:IsA("ProximityPrompt") and desc)
-      local target = desc:IsA("ProximityPrompt") and desc.Parent or desc
+  local candidates = {}
+  local seen = {}
+
+  local function checkCandidate(inst)
+    if not inst or not inst.Parent or seen[inst] then return end
+    seen[inst] = true
+
+    -- Exclude tools held by player or other characters
+    if inst:FindFirstAncestorWhichIsA("Tool") and (inst:FindFirstAncestorWhichIsA("Model") and inst:FindFirstAncestorWhichIsA("Model"):FindFirstChildOfClass("Humanoid")) then
+      return
+    end
+    if inst:FindFirstAncestor("Door") then return end
+
+    local n = inst.Name:lower()
+    if n:find("fake", 1, true) or n:find("padlock", 1, true) or n:find("door", 1, true) or n:find("board", 1, true) or n:find("closet", 1, true) or n:find("wardrobe", 1, true) then
+      return
+    end
+
+    local isKey = false
+    if n == "keyobtain" or n == "key" or n == "keyiron" or n == "ironkey"
+      or n == "skeletonkey" or n == "keyelectrical" or n == "electricalkeyobtain"
+      or n == "electricalkey" or n == "ironkeyforcrypt" or n:match("^key_%d+$") or n:match("^key%d+$")
+      or (n:find("key", 1, true) and not n:find("lock", 1, true)) then
+      isKey = true
+    end
+
+    local pr = inst:FindFirstChildWhichIsA("ProximityPrompt", true) or (inst:IsA("ProximityPrompt") and inst)
+    if pr then
+      local ot = pr.ObjectText:lower()
+      local at = pr.ActionText:lower()
+      if (ot:find("key", 1, true) or at:find("key", 1, true)) and not ot:find("lock", 1, true) and not ot:find("padlock", 1, true) then
+        isKey = true
+      end
+    end
+
+    if isKey then
+      local target = (inst:IsA("ProximityPrompt") and inst.Parent) or inst
       local pos = GetInstancePosition(target) or (pr and pr.Parent and GetInstancePosition(pr.Parent))
       if pos and (not pr or pr.Enabled) then
-        return target, pos, pr
+        local dist = rootPos and (pos - rootPos).Magnitude or 0
+        table.insert(candidates, { target = target, pos = pos, pr = pr, dist = dist })
       end
     end
   end
 
-  -- Pass 2: Check ESPCategories if active
-  local espTarget = nil
+  -- 1. Search current room descendants
+  if room then
+    for _, desc in ipairs(room:GetDescendants()) do
+      checkCandidate(desc)
+    end
+  end
+
+  -- 2. Search Room 0 (Reception / starting lobby) if available
+  local curRooms = workspace:FindFirstChild("CurrentRooms")
+  if curRooms then
+    local r0 = curRooms:FindFirstChild("0")
+    if r0 and r0 ~= room then
+      for _, desc in ipairs(r0:GetDescendants()) do
+        checkCandidate(desc)
+      end
+    end
+  end
+
+  -- 3. Search workspace.Drops (dropped keys, floor items)
+  local drops = workspace:FindFirstChild("Drops")
+  if drops then
+    for _, desc in ipairs(drops:GetDescendants()) do
+      checkCandidate(desc)
+    end
+  end
+
+  -- 4. Search ESPCategories.Keys if active
   pcall(function()
     if ESPCategories and ESPCategories.Keys then
       for _, kInst in ipairs(ESPCategories.Keys) do
-        if kInst and kInst.Parent and not kInst:FindFirstAncestorWhichIsA("Tool") then
-          local pr = kInst:FindFirstChildWhichIsA("ProximityPrompt", true) or (kInst:IsA("ProximityPrompt") and kInst)
-          local target = kInst:IsA("ProximityPrompt") and kInst.Parent or kInst
-          local pos = GetInstancePosition(target)
-          if pos and (not pr or pr.Enabled) then
-            espTarget = target
-            return
-          end
-        end
+        checkCandidate(kInst)
       end
     end
   end)
-  if espTarget then
-    local pr = espTarget:FindFirstChildWhichIsA("ProximityPrompt", true) or (espTarget:IsA("ProximityPrompt") and espTarget)
-    local pos = GetInstancePosition(espTarget)
-    if pos then return espTarget, pos, pr end
-  end
 
-  -- Pass 3: ProximityPrompt with "key" in action/object text
-  for _, desc in ipairs(room:GetDescendants()) do
-    if desc:IsA("ProximityPrompt") and desc.Enabled then
-      local objT = desc.ObjectText:lower()
-      local actT = desc.ActionText:lower()
-      local pName = desc.Parent and desc.Parent.Name:lower() or ""
-      if (objT:find("key", 1, true) or actT:find("key", 1, true) or pName:find("key", 1, true))
-        and not objT:find("fake", 1, true) and not pName:find("fake", 1, true)
-        and not pName:find("lock", 1, true) and not objT:find("padlock", 1, true)
-        and not pName:find("door", 1, true) and not desc:FindFirstAncestor("Door") then
-        local target = desc.Parent
-        local pos = GetInstancePosition(target)
-        if pos then
-          return target, pos, desc
-        end
+  -- 5. Search workspace.CurrentRooms broadly within 150 studs
+  if curRooms then
+    for _, desc in ipairs(curRooms:GetDescendants()) do
+      local n = desc.Name:lower()
+      if n:find("key", 1, true) then
+        checkCandidate(desc)
       end
     end
   end
 
-  -- Pass 4: Search CurrentRooms broadly for any Key within 120 studs of player
-  local char = localPlayer2 and localPlayer2.Character
-  local root = char and char:FindFirstChild("HumanoidRootPart")
-  if root then
-    local curRooms = workspace:FindFirstChild("CurrentRooms")
-    if curRooms then
-      for _, desc in ipairs(curRooms:GetDescendants()) do
-        local n = desc.Name
-        if (n == "KeyObtain" or n == "KeyIron" or n == "IronKey" or n == "Key") and not desc:FindFirstAncestorWhichIsA("Tool") and not desc:FindFirstAncestor("Door") then
-          local pos = GetInstancePosition(desc)
-          if pos and (pos - root.Position).Magnitude <= 120 then
-            local pr = desc:FindFirstChildWhichIsA("ProximityPrompt", true) or (desc:IsA("ProximityPrompt") and desc)
-            if not pr or pr.Enabled then
-              return desc, pos, pr
-            end
-          end
-        end
-      end
+  -- 6. Search workspace directly for loose key models within 150 studs
+  for _, ch in ipairs(workspace:GetChildren()) do
+    if ch.Name:lower():find("key", 1, true) and not ch:IsA("Terrain") and not ch:IsA("Camera") then
+      checkCandidate(ch)
     end
+  end
+
+  if #candidates > 0 then
+    table.sort(candidates, function(a, b) return a.dist < b.dist end)
+    local best = candidates[1]
+    return best.target, best.pos, best.pr
   end
 
   return nil, nil, nil
@@ -12472,6 +12493,11 @@ ResolveKeyAndUnlock = function(room, exitDoor, roomNum)
 
   -- Disable collisions for bedside tables, chairs, props in room
   DisableObstacleCollision(room)
+  if roomNum and roomNum <= 1 then
+    local curRooms = workspace:FindFirstChild("CurrentRooms")
+    local r0 = curRooms and curRooms:FindFirstChild("0")
+    if r0 then DisableObstacleCollision(r0) end
+  end
 
   -- 1. Check if player already holds or has key in backpack
   local hasTool = PlayerHasKeyOrLockpick()
@@ -12482,7 +12508,7 @@ ResolveKeyAndUnlock = function(room, exitDoor, roomNum)
 
     local keyObj, keyPos, keyPr = FindRoomKey(room)
 
-    -- If not immediately on tables/shelves, inspect drawers & containers
+    -- If not immediately found, inspect drawers & containers
     if not keyObj then
       KnobFarm.SetStatus("Room " .. tostring(roomNum) .. ": Checking drawers for key...")
       local drawers = LootDrawersInRoom(room)
@@ -12500,6 +12526,26 @@ ResolveKeyAndUnlock = function(room, exitDoor, roomNum)
           if keyObj then break end
         end
       end
+
+      -- If room 0/1, also check drawers in room 0
+      if not keyObj and roomNum and roomNum <= 1 then
+        local curRooms = workspace:FindFirstChild("CurrentRooms")
+        local r0 = curRooms and curRooms:FindFirstChild("0")
+        if r0 and r0 ~= room then
+          local d0 = LootDrawersInRoom(r0)
+          for _, d in ipairs(d0) do
+            if not KnobFarm.Active or _Unloading or hum.Health <= 0 then break end
+            if d.prompt and d.prompt.Enabled and not KnobFarm.LootedObjects[d.parent] then
+              NavigateTo(d.pos, d.parent, "Container", 4.0, "Drawer")
+              TriggerPrompt(d.prompt)
+              KnobFarm.LootedObjects[d.parent] = true
+              task.wait(0.1)
+              keyObj, keyPos, keyPr = FindRoomKey(room)
+              if keyObj then break end
+            end
+          end
+        end
+      end
     end
 
     -- Navigate directly to the key and pick it up
@@ -12509,15 +12555,18 @@ ResolveKeyAndUnlock = function(room, exitDoor, roomNum)
       NavigateTo(keyPos, keyObj, "Key", 6.0, "Key")
       task.wait(0.05)
 
-      for attempt = 1, 5 do
+      -- Position character directly on top of key for 100% prompt proximity reach
+      if root then
+        root.CFrame = CFrame.new(keyPos + Vector3.new(0, 1.2, 0))
+      end
+
+      for attempt = 1, 8 do
         if PlayerHasKeyOrLockpick() then break end
-        if keyPr and keyPr.Enabled then
-          TriggerPrompt(keyPr)
-        else
-          local p = (keyObj:IsA("ProximityPrompt") and keyObj) or keyObj:FindFirstChildWhichIsA("ProximityPrompt", true)
-          if p and p.Enabled then TriggerPrompt(p) end
+        local p = keyPr or (keyObj:IsA("ProximityPrompt") and keyObj) or keyObj:FindFirstChildWhichIsA("ProximityPrompt", true)
+        if p and p.Enabled then
+          TriggerPrompt(p)
         end
-        task.wait(0.12)
+        task.wait(0.1)
       end
       KnobFarm.LootedObjects[keyObj] = true
       task.wait(0.1)
@@ -12720,10 +12769,8 @@ GetPlayerCurrentRoom = function()
   -- 1. Check localPlayer attribute if set by game
   local attrRoom = localPlayer2 and localPlayer2:GetAttribute("CurrentRoom")
   if attrRoom and typeof(attrRoom) == "number" then
-    if not (KnobFarm.PassedFirstDoor and attrRoom < 1) then
-      local r = roomsFolder:FindFirstChild(tostring(attrRoom))
-      if r then return r, attrRoom end
-    end
+    local r = roomsFolder:FindFirstChild(tostring(attrRoom))
+    if r then return r, attrRoom end
   end
 
   -- 2. Physical room detection by bounding box / containment
@@ -12733,19 +12780,16 @@ GetPlayerCurrentRoom = function()
   for _, r in ipairs(roomsFolder:GetChildren()) do
     local n = tonumber(r.Name)
     if n then
-      if not (KnobFarm.PassedFirstDoor and n < 1) then
-        local ok, cf, sz = pcall(function() return r:GetBoundingBox() end)
-        if ok and cf and sz then
-          local localP = cf:PointToObjectSpace(root.Position)
-          local inX = math.abs(localP.X) <= (sz.X / 2 + 4)
-          local inZ = math.abs(localP.Z) <= (sz.Z / 2 + 4)
-          local inY = math.abs(localP.Y) <= (sz.Y / 2 + 10)
-          if inX and inZ and inY then
-            -- If overlapping near doorways, pick the highest room number
-            if not candidateNum or n > candidateNum then
-              candidateRoom = r
-              candidateNum = n
-            end
+      local ok, cf, sz = pcall(function() return r:GetBoundingBox() end)
+      if ok and cf and sz then
+        local localP = cf:PointToObjectSpace(root.Position)
+        local inX = math.abs(localP.X) <= (sz.X / 2 + 4)
+        local inZ = math.abs(localP.Z) <= (sz.Z / 2 + 4)
+        local inY = math.abs(localP.Y) <= (sz.Y / 2 + 10)
+        if inX and inZ and inY then
+          if not candidateNum or n > candidateNum then
+            candidateRoom = r
+            candidateNum = n
           end
         end
       end
@@ -12768,9 +12812,7 @@ GetPlayerCurrentRoom = function()
     end
     if p and p.Parent == roomsFolder and tonumber(p.Name) then
       local n = tonumber(p.Name)
-      if not (KnobFarm.PassedFirstDoor and n < 1) then
-        return p, n
-      end
+      return p, n
     end
   end
 
@@ -12779,21 +12821,18 @@ GetPlayerCurrentRoom = function()
   local latestRoom = gameData and gameData:FindFirstChild("LatestRoom")
   if latestRoom and typeof(latestRoom.Value) == "number" then
     local lrNum = latestRoom.Value
-    if KnobFarm.PassedFirstDoor and lrNum < 1 then lrNum = 1 end
     local r = roomsFolder:FindFirstChild(tostring(lrNum))
     if r then return r, lrNum end
   end
 
   -- 5. Fallback: Current active room state
-  if KnobFarm.CurrentRoomNum and KnobFarm.CurrentRoomNum > 0 then
+  if KnobFarm.CurrentRoomNum then
     local r = roomsFolder:FindFirstChild(tostring(KnobFarm.CurrentRoomNum))
     if r then return r, KnobFarm.CurrentRoomNum end
   end
 
-  local defaultRoom = (KnobFarm.PassedFirstDoor and roomsFolder:FindFirstChild("1"))
-    or roomsFolder:FindFirstChild("0")
-    or roomsFolder:FindFirstChild("1")
-  return defaultRoom, (defaultRoom and tonumber(defaultRoom.Name)) or (KnobFarm.PassedFirstDoor and 1 or 0)
+  local defaultRoom = roomsFolder:FindFirstChild("0") or roomsFolder:FindFirstChild("1")
+  return defaultRoom, (defaultRoom and tonumber(defaultRoom.Name)) or 0
 end
 
 HasRoomGate = function(room)
@@ -14417,7 +14456,7 @@ function KnobFarm.RunLoop()
         task.wait(0.2)
       end
 
-      if roomNum >= 0 then
+      if roomNum and roomNum >= 1 then
         KnobFarm.PassedFirstDoor = true
       end
     end
