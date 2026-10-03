@@ -5594,7 +5594,7 @@ do
 
       local distMoved = (currRoot.Position - lastSafeCFrame.Position).Magnitude
       if distMoved > phantomTolerance then
-        if (KnobFarm and (KnobFarm.Teleporting or KnobFarm.InSeekChase or KnobFarm.SeekChaseStartRoom))
+        if (KnobFarm and (KnobFarm.Active or KnobFarm.Teleporting or KnobFarm.InSeekChase or KnobFarm.SeekChaseStartRoom))
           or (toggles and toggles.AutoDoorSkip and toggles.AutoDoorSkip.Value) then
           lastSafeCFrame = currRoot.CFrame
         else
@@ -12204,9 +12204,30 @@ local function HasFloorUnder(pos, maxDist)
   if val85 and val85.HotelNodesFolder then table.insert(filter, val85.HotelNodesFolder) end
   rayParams.FilterDescendantsInstances = filter
 
-  local checkDist = maxDist or 30
-  local hit = workspace:Raycast(pos + Vector3.new(0, 8.0, 0), Vector3.new(0, -(checkDist + 8.0), 0), rayParams)
+  local checkDist = maxDist or 35
+  local hit = workspace:Raycast(pos + Vector3.new(0, 4.0, 0), Vector3.new(0, -(checkDist + 4.0), 0), rayParams)
   if hit and hit.Instance then
+    local inst = hit.Instance
+    local iName = inst.Name:lower()
+    local pName = inst.Parent and inst.Parent.Name:lower() or ""
+    local isFurniture = iName:find("desk", 1, true) or iName:find("counter", 1, true)
+      or iName:find("table", 1, true) or iName:find("bed", 1, true) or iName:find("cart", 1, true)
+      or iName:find("luggage", 1, true) or iName:find("chair", 1, true) or iName:find("shelf", 1, true)
+      or pName:find("desk", 1, true) or pName:find("counter", 1, true) or pName:find("table", 1, true)
+      or pName:find("bed", 1, true) or pName:find("cart", 1, true) or pName:find("luggage", 1, true)
+    
+    if isFurniture then
+      local deepFilter = { char, inst, inst.Parent }
+      if val85 and val85.HotelNodesFolder then table.insert(deepFilter, val85.HotelNodesFolder) end
+      local deepParams = RaycastParams.new()
+      deepParams.FilterType = Enum.RaycastFilterType.Exclude
+      deepParams.FilterDescendantsInstances = deepFilter
+      local hit2 = workspace:Raycast(hit.Position - Vector3.new(0, 0.1, 0), Vector3.new(0, -15, 0), deepParams)
+      if hit2 and hit2.Instance then
+        return true, hit2.Position, hit2.Instance
+      end
+    end
+
     return true, hit.Position, hit.Instance
   end
   return false, nil, nil
@@ -13344,29 +13365,34 @@ PassDoorStraight = function(door, root, hum)
   OpenDoor(door)
   KnobFarm.OpenedDoors[door] = true
 
-  -- 3. Быстрый сквозной импульс вперед через проем на полной скорости
+  -- 3. Быстрый сквозной импульс вперед через проем на полной скорости (плавный полет через створку)
   local passStart = tick()
   while tick() - passStart < 0.4 and KnobFarm.Active and not _Unloading do
     local rel = root.Position - center
-    if rel:Dot(passDir) >= 2.5 then
+    if rel:Dot(passDir) >= 3.0 then
       break
     end
 
-    if options and options.Walkspeed and options.Walkspeed.Value ~= farmSpeed then
-      options.Walkspeed:SetValue(farmSpeed)
+    if char then
+      for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then p.CanCollide = false end
+      end
     end
-    if hum and hum.WalkSpeed ~= farmSpeed then
-      hum.WalkSpeed = farmSpeed
+
+    local curPos = root.Position
+    local curY = curPos.Y
+    local hasF, fPos = HasFloorUnder(curPos, 35)
+    if hasF and fPos then
+      curY = fPos.Y + 2.8
     end
+
+    local passStep = passDir * (farmSpeed * 0.025)
+    local nextPos = Vector3.new(curPos.X + passStep.X, curY, curPos.Z + passStep.Z)
+    root.CFrame = CFrame.new(nextPos, nextPos + passDir)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
 
     hum:Move(passDir, false)
-
-    -- Anti-void altitude stabilization while passing door threshold
-    local hasF, fPos = HasFloorUnder(root.Position, 35)
-    if hasF and fPos and root.Position.Y < fPos.Y + 2.2 then
-      root.CFrame = CFrame.new(root.Position.X, fPos.Y + 2.8, root.Position.Z) * (root.CFrame - root.Position)
-      root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
-    end
 
     pcall(function()
       local cam = workspace.CurrentCamera
@@ -13742,9 +13768,9 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
     hum.WalkSpeed = desiredSpeed
   end
 
-  -- Continuous RenderStepped steering: fluid lookahead velocity without MoveTo stutter
+  -- Continuous RenderStepped steering: fluid CFrame noclip flight without collision blocks
   local moveConn
-  moveConn = runService.RenderStepped:Connect(function()
+  moveConn = runService.RenderStepped:Connect(function(dt)
     if not KnobFarm.Active or _Unloading or IsUserMovingManually() then
       completed = true
       return
@@ -13758,6 +13784,14 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
       return
     end
 
+    -- Continuous noclip: disable collision on all character parts every frame
+    for _, p in ipairs(c:GetDescendants()) do
+      if p:IsA("BasePart") then
+        p.CanCollide = false
+      end
+    end
+
+    local dtClamped = math.clamp(dt or 0.016, 0.001, 0.05)
     local curDesiredSpeed = (options and options.AutoFarmSpeed and options.AutoFarmSpeed.Value)
       or (options and options.AutoFarmWalkSpeed and options.AutoFarmWalkSpeed.Value) or desiredSpeed
     if options and options.Walkspeed and options.Walkspeed.Value ~= curDesiredSpeed then
@@ -13768,7 +13802,7 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
 
     local rootPos = root.Position
 
-    -- Advance waypoint index forward: строго по перпендикулярным прямым без срезания углов
+    -- Advance waypoint index forward: плавно продвигаем узел
     while wpIndex < #waypoints do
       local curWp = waypoints[wpIndex]
       local curPos = (typeof(curWp) == "Vector3" and curWp) or (curWp and curWp.Position)
@@ -13778,8 +13812,8 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
       local flatDist = math.sqrt(dx * dx + dz * dz)
 
       local isOrtho = (options and options.AutoFarmMovementMode and options.AutoFarmMovementMode.Value == "Orthogonal")
-      local reachDist = isOrtho and 2.2 or 3.0
-      local lookaheadDist = isOrtho and 3.5 or 5.0
+      local reachDist = isOrtho and 2.2 or 3.2
+      local lookaheadDist = isOrtho and 3.5 or 5.5
 
       if flatDist < reachDist then
         if currentNodes[wpIndex] and currentNodes[wpIndex].Parent then
@@ -13819,7 +13853,7 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
     local targetPoint = (curWp and ((typeof(curWp) == "Vector3" and curWp) or curWp.Position)) or targetPos
     currentTargetPoint = targetPoint
 
-    -- Anti-Void Altitude Lock: удерживаем высоту над полом комнаты (исключаем провал в пустоту при ноуклипе)
+    -- Anti-Void Altitude Lock: удерживаем стабильную высоту над истинным полом комнаты
     local hasF, fPos = HasFloorUnder(rootPos, 35)
     local desiredY = nil
     if hasF and fPos then
@@ -13828,23 +13862,35 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
       desiredY = targetPoint.Y
     end
 
-    if desiredY then
-      if rootPos.Y < desiredY - 0.4 then
-        root.CFrame = CFrame.new(rootPos.X, desiredY, rootPos.Z) * (root.CFrame - rootPos)
-        root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
-      elseif rootPos.Y > desiredY + 2.5 and not isOrtho then
-        root.CFrame = CFrame.new(rootPos.X, desiredY, rootPos.Z) * (root.CFrame - rootPos)
-        root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
-      end
-    end
-
     local steerX = targetPoint.X - rootPos.X
     local steerZ = targetPoint.Z - rootPos.Z
     local steerDist = math.sqrt(steerX * steerX + steerZ * steerZ)
 
-    if steerDist > 0.1 then
-      local moveDir = Vector3.new(steerX / steerDist, 0, steerZ / steerDist)
-      h:Move(moveDir, false)
+    if steerDist > 0.05 then
+      local dirX = steerX / steerDist
+      local dirZ = steerZ / steerDist
+      local moveDist = math.min(steerDist, curDesiredSpeed * dtClamped)
+
+      local nextX = rootPos.X + dirX * moveDist
+      local nextZ = rootPos.Z + dirZ * moveDist
+      local nextY = rootPos.Y
+      if desiredY then
+        local yDiff = desiredY - rootPos.Y
+        if math.abs(yDiff) > 1.8 then
+          nextY = desiredY
+        else
+          nextY = rootPos.Y + yDiff * math.clamp(dtClamped * 14, 0, 1)
+        end
+      end
+
+      -- Плавное перемещение CFrame сквозь любые препятствия (стойки, перегородки, стены, кровати)
+      local lookCF = CFrame.new(Vector3.new(nextX, nextY, nextZ), Vector3.new(nextX + dirX, nextY, nextZ + dirZ))
+      root.CFrame = lookCF
+      root.AssemblyLinearVelocity = Vector3.zero
+      root.AssemblyAngularVelocity = Vector3.zero
+
+      -- Анимация ходьбы/бега
+      h:Move(Vector3.new(dirX, 0, dirZ), false)
 
       pcall(function()
         local cam = workspace.CurrentCamera
@@ -13855,6 +13901,8 @@ FollowPath = function(waypoints, target, targetPos, targetType, room, roomNum)
         end
       end)
     else
+      root.AssemblyLinearVelocity = Vector3.zero
+      root.AssemblyAngularVelocity = Vector3.zero
       h:Move(Vector3.zero, false)
     end
 
@@ -14035,30 +14083,7 @@ NavigateTo = function(targetPos, targetInstance, label, maxWaitTime, targetType)
   if navWaypoints and #navWaypoints > 1 then
     FollowPath(navWaypoints, targetInstance, floorPos, targetType or label or "Target", nil, KnobFarm.CurrentRoomNum)
   else
-    hum:MoveTo(floorPos)
-    local t = tick()
-    local timeout = maxWaitTime or 4.0
-    while (root.Position - floorPos).Magnitude > 6 and tick() - t < timeout and hum.Health > 0 and KnobFarm.Active and not _Unloading do
-      local hasF, fPos = HasFloorUnder(root.Position, 35)
-      if hasF and fPos and root.Position.Y < fPos.Y + 2.2 then
-        root.CFrame = CFrame.new(root.Position.X, fPos.Y + 2.8, root.Position.Z) * (root.CFrame - root.Position)
-        root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
-      end
-
-      if not HasFloorUnder(root.Position, 40) and not HasFloorUnder(root.Position + Vector3.new(0, 15, 0), 55) then
-        RecoverFromVoid(nil)
-        break
-      end
-      pcall(function()
-        local cam = workspace.CurrentCamera
-        if cam then
-          local camPos = cam.CFrame.Position
-          local lookTarget = Vector3.new(floorPos.X, camPos.Y, floorPos.Z)
-          cam.CFrame = cam.CFrame:Lerp(CFrame.new(camPos, lookTarget), 0.25)
-        end
-      end)
-      task.wait(0.05)
-    end
+    FollowPath({ root.Position, floorPos }, targetInstance, floorPos, targetType or label or "Target", nil, KnobFarm.CurrentRoomNum)
   end
   return true
 end
@@ -15229,6 +15254,20 @@ function KnobFarm.Start()
     end
   end)
 
+  if not KnobFarm.NoclipConn then
+    KnobFarm.NoclipConn = runService.Stepped:Connect(function()
+      if not KnobFarm.Active then return end
+      local c = localPlayer2 and localPlayer2.Character
+      if c then
+        for _, p in ipairs(c:GetDescendants()) do
+          if p:IsA("BasePart") then
+            p.CanCollide = false
+          end
+        end
+      end
+    end)
+  end
+
   KnobFarm.Thread = task.spawn(KnobFarm.RunLoop)
 end
 
@@ -15240,6 +15279,10 @@ function KnobFarm.Stop()
   KnobFarm.RoomEntryTime = 0
   KnobFarm.LootedObjects = setmetatable({}, { __mode = "k" })
   KnobFarm.OpenedDoors = setmetatable({}, { __mode = "k" })
+  if KnobFarm.NoclipConn then
+    pcall(function() KnobFarm.NoclipConn:Disconnect() end)
+    KnobFarm.NoclipConn = nil
+  end
   if obstacleListener then
     pcall(function() obstacleListener:Disconnect() end)
     obstacleListener = nil
